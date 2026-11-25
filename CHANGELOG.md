@@ -11,3 +11,4 @@
 - Added immutable class-based structural declarations (`Module`, `ObjectType`, `Value`, `Link`, `ObjectRef`) with explicit identity and version, typed properties, typed link specs, and frozen exports.
 - Added immutable behavioral declarations (`Action`, `Function`, `Effect`) with typed params, `reads`/`writes`/`calls`, `permission`, commit requirement, and effect payload metadata, enabling tier-1, cross-module, and approval/effect declarations without executing handlers.
 - Added structured approval predicates that preserve each comparison operator (including `>` versus `>=`) and reject lambdas, method calls, and other unsupported expressions with clear errors.
+- Added a `load()` phase that collects declarations per owning module into an immutable model, keeps each declared identity and version, and rejects duplicate identities or unknown declaration fields with module, identity, and field context.

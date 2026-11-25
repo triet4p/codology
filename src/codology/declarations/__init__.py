@@ -32,6 +32,7 @@ from codology.declarations.handler import (
     handler_signature,
 )
 from codology.declarations.primitives import (
+    DECLARATION_FIELDS,
     Declaration,
     DeclarationError,
     DeclarationMeta,
@@ -49,6 +50,7 @@ __all__ = [
     "Approval",
     "CommitRequirement",
     "Comparison",
+    "DECLARATION_FIELDS",
     "Declaration",
     "DeclarationError",
     "DeclarationMeta",

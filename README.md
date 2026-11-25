@@ -9,7 +9,7 @@ Repository đang ở Sprint 3 — Declarations & Linked Registry. Phần đã c�
 - `codology` import được từ môi trường sạch, không cần database, credential hay backend SDK.
 - `codology.declarations` cung cấp primitive cấu trúc bất biến `Module`, `ObjectType`, `Value`, `Link` và `ObjectRef[T]`: identity/version tường minh, property có kiểu, link có target/cardinality/traversal và `exports` đóng băng.
 - `codology.declarations` cung cấp `Action`, `Function`, `Effect` và predicate approval cấu trúc: `params`, `reads`/`writes`/`calls`, `permission`, `commitRequirement`, `approval` và `effects` được đóng băng lúc khai báo; không chạy handler hay đánh giá predicate.
-- Load, Link, snapshot, binding, engine và adapter **chưa được triển khai**; các task sau trong sprint bổ sung dần.
+- Load đã được triển khai; Link, snapshot, binding, engine và adapter **chưa được triển khai**; các task sau trong sprint bổ sung dần.
 
 ## Yêu cầu
 
@@ -40,6 +40,7 @@ uv run ruff format --check .
 src/codology/
   __init__.py
   py.typed
+  loading.py        # Load: thu thập definition, kiểm tra identity và field
   declarations/
     __init__.py
     annotations.py   # giữ annotation thô, resolve ở pha Link
@@ -51,6 +52,7 @@ tests/
   test_behavior.py
   test_declarations.py
   test_handler.py
+  test_loading.py
   test_package.py
 ```
 
@@ -141,6 +143,25 @@ approval = Approval.conditional(
 
 `when` chỉ nhận predicate cấu trúc: so sánh `>`, `>=`, `<`, `<=`, `==`, `!=` và `all_of`/`any_of`/`not_` (hoặc `.and_`/`.or_`/`.not_`). Lambda, phép toán số học và method call bị từ chối ngay lúc khai báo, kèm tên biểu thức không được hỗ trợ. `>` và `>=` là hai toán tử khác nhau trong predicate. Khai báo không đánh giá predicate trên dữ liệu thật, không gọi handler và không giao effect.
 
+## Load: thu thập và kiểm tra declaration
+
+`load` nhận một hoặc nhiều `ModuleDeclarations`: mỗi nhóm gồm một `Module` và mọi definition mà module đó sở hữu, kể cả definition không nằm trong `exports`. Kết quả là `LoadedDeclarations` bất biến với ánh xạ module và definition theo identity đã khai báo.
+
+```python
+from codology import ModuleDeclarations, load
+
+loaded = load(
+    ModuleDeclarations(Procurement, [PurchaseOrder, ApprovePurchaseOrder]),
+    ModuleDeclarations(Finance, [Budget, ReserveBudget]),
+)
+reserved = loaded.definitions["finance.reserve_budget"]
+assert reserved.owner == "finance" and reserved.version == "1.0.0"
+```
+
+Load từ chối identity trùng (`DuplicateIdentity`) và field khai báo không hợp lệ (`UnknownDeclarationKey`). Cả hai lỗi đều kèm module, identity và field để author sửa; một field gõ nhầm trong thân class bị từ chối thay vì bị bỏ qua. Identity luôn lấy từ `identity` đã khai báo, không suy từ tên class: hai class cùng tên `Budget` nhưng identity khác nhau load được bình thường, và `Value` không khai identity giữ `identity = None`. Collection đầu vào được sao chép tại Load; sửa chúng sau đó không làm đổi kết quả.
+
+Load **không** resolve reference, kiểm tra export hay gọi handler; các việc đó thuộc Link và các pha sau.
+
 ## Quyết định đã chốt
 
 - **Một quy ước handler duy nhất:** `def handler(self, ctx, ...)` trên class khai báo. `@staticmethod def handle(...)` không được hỗ trợ; không có API thứ hai để giữ đồng bộ. `self` không mang execution state.
@@ -151,7 +172,7 @@ approval = Approval.conditional(
 ## Giới hạn
 
 - Đây là lớp mô hình **tĩnh**. Chưa có engine `query`/`invoke`, authorization, session/Unit of Work, atomic commit, approval callback hay effect delivery.
-- Chưa có Load/Link/registry; các kiểm tra identity, export và reference liên module thuộc các task kế tiếp của Sprint 3.
+- Load đã thu thập definition và kiểm tra identity/field; Link, registry và kiểm tra export/reference liên module thuộc các task kế tiếp của Sprint 3.
 - Predicate approval chỉ được lưu dạng cấu trúc; chưa có đánh giá ngưỡng, callback duyệt hay giao effect. `Function` dùng cùng quy ước `handler(self, ctx, ...)` với `Action` theo implementation baseline.
 - Không có tuyên bố `ATOMIC`, authorization hay execution đã hoạt động. Metadata `ATOMIC` được lưu trong mô hình (khi có) không chứng minh backend đáp ứng atomicity.
 - Static validation không phát hiện truy cập ẩn trong thân handler (import lén, `getattr` động, đọc file/socket). Đó là rủi ro đã ghi nhận, xử lý bằng review và test.

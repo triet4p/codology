@@ -20,17 +20,17 @@ from codology.declarations.annotations import raw_annotations
 
 Cardinality = Literal["one", "many"]
 Traversal = Literal["navigable", "internal"]
-
 _CARDINALITIES: Final = frozenset({"one", "many"})
 _TRAVERSALS: Final = frozenset({"navigable", "internal"})
-_METADATA_NAMES: Final = frozenset(
+
+DECLARATION_FIELDS: Final = frozenset(
     {
         "identity",
         "version",
+        "properties",
         "exports",
         "keyType",
         "links",
-        "properties",
         "params",
         "reads",
         "writes",
@@ -98,7 +98,7 @@ class Declaration(metaclass=DeclarationMeta):
         properties = {
             name: annotation
             for name, annotation in raw_annotations(cls).items()
-            if name not in _METADATA_NAMES
+            if name not in DECLARATION_FIELDS
         }
         for name, value in own.items():
             if isinstance(value, type) and issubclass(value, Link):
