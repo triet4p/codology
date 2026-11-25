@@ -7,6 +7,7 @@ Codology (Ontology as Code) là lớp mô hình tĩnh cho phép developer khai b
 Repository đang ở Sprint 3 — Declarations & Linked Registry. Phần đã có là project scaffold và hạ tầng khai báo tĩnh:
 
 - `codology` import được từ môi trường sạch, không cần database, credential hay backend SDK.
+- `codology.declarations` cung cấp primitive cấu trúc bất biến `Module`, `ObjectType`, `Value`, `Link` và `ObjectRef[T]`: identity/version tường minh, property có kiểu, link có target/cardinality/traversal và `exports` đóng băng.
 - `codology.declarations` cung cấp quy ước handler duy nhất và cơ chế resolve forward annotation ở pha Link.
 - Load, Link, snapshot, binding, engine và adapter **chưa được triển khai**; các task sau trong sprint bổ sung dần.
 
@@ -43,11 +44,52 @@ src/codology/
     __init__.py
     annotations.py   # giữ annotation thô, resolve ở pha Link
     handler.py       # quy ước handler duy nhất
+    primitives.py    # Module/ObjectType/Value/Link/ObjectRef bất biến
 tests/
   test_annotations.py
+  test_declarations.py
   test_handler.py
   test_package.py
 ```
+
+## Khai báo cấu trúc
+
+```python
+from decimal import Decimal
+
+from codology.declarations import Link, Module, ObjectRef, ObjectType, Value
+
+
+class Money(Value):
+    amount: Decimal
+    currency: str
+
+
+class Budget(ObjectType):
+    identity = "finance.budget"
+    version = "1.0.0"
+    keyType = "B"
+    limit: Money
+    reserved: Money
+
+
+class PurchaseOrder(ObjectType):
+    identity = "procurement.purchase_order"
+    version = "1.0.0"
+    keyType = "PO"
+    budget = Link[Budget, "one", "navigable"]
+
+
+class Procurement(Module):
+    identity = "procurement"
+    version = "1.0.0"
+    exports = (PurchaseOrder,)
+
+
+order_ref = ObjectRef[PurchaseOrder]
+```
+
+Identity và version phải được khai báo tường minh, không suy từ tên class. Class khai báo và các collection đầu vào (`exports`, `links`, annotation) được sao chép và đóng băng lúc tạo; sửa chúng sau đó không làm đổi declaration. `exports` là ranh giới sở hữu, không phải quyền truy cập; việc kiểm tra reference liên module thuộc pha Link (chưa triển khai).
 
 ## Quyết định đã chốt
 

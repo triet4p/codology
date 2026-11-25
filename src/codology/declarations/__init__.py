@@ -11,10 +11,28 @@ from codology.declarations.handler import (
     HandlerConventionError,
     handler_signature,
 )
+from codology.declarations.primitives import (
+    Declaration,
+    DeclarationError,
+    DeclarationMeta,
+    Link,
+    Module,
+    ObjectRef,
+    ObjectType,
+    Value,
+)
 
 __all__ = [
+    "Declaration",
+    "DeclarationError",
+    "DeclarationMeta",
     "HANDLER_NAME",
     "HandlerConventionError",
+    "Link",
+    "Module",
+    "ObjectRef",
+    "ObjectType",
+    "Value",
     "handler_signature",
     "raw_annotations",
     "resolve_annotations",
