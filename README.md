@@ -10,6 +10,7 @@ Repository đang ở Sprint 3 — Declarations & Linked Registry. Phần đã c�
 - `codology.declarations` cung cấp primitive cấu trúc bất biến `Module`, `ObjectType`, `Value`, `Link` và `ObjectRef[T]`: identity/version tường minh, property có kiểu, link có target/cardinality/traversal và `exports` đóng băng.
 - `codology.declarations` cung cấp `Action`, `Function`, `Effect` và predicate approval cấu trúc: `params`, `reads`/`writes`/`calls`, `permission`, `commitRequirement`, `approval` và `effects` được đóng băng lúc khai báo; không chạy handler hay đánh giá predicate.
 - Load, Link và `snapshot()` đã được triển khai; snapshot công bố graph đã link dưới dạng bất biến, tra cứu tường minh theo identity/version.
+- Ví dụ Procurement/Finance chạy được trên API thật (`examples/procurement_finance/`) cùng kiểm thử tích hợp và kiểm tra typing cho cả đường thành công lẫn lỗi tĩnh.
 - Deployment binding, registry bền vững, publish artifact, engine và adapter **chưa được triển khai**; các task sau trong sprint bổ sung dần.
 
 ## Yêu cầu
@@ -29,6 +30,7 @@ Lệnh trên tạo `.venv`, cài package ở chế độ editable và cài nhóm
 
 ```bash
 uv run python -c "import codology; print(codology.__version__)"
+uv run python -m examples.procurement_finance
 uv run pytest
 uv run pyright
 uv run ruff check .
@@ -50,6 +52,13 @@ src/codology/
     behavior.py      # Action/Function/Effect và governance metadata
     handler.py       # quy ước handler duy nhất
     primitives.py    # Module/ObjectType/Value/Link/ObjectRef bất biến
+examples/procurement_finance/
+  common.py          # Money, Value cấu trúc dùng chung
+  finance.py         # Budget, ReserveBudget, Finance
+  procurement.py     # PurchaseOrder, effect, ApprovePurchaseOrder, Procurement
+  model.py           # ghép nhóm, load/link/snapshot
+  scenarios.py       # sáu ca lỗi tĩnh có thể chạy
+  __main__.py        # entry point của ví dụ
 tests/
   test_annotations.py
   test_behavior.py
@@ -58,7 +67,11 @@ tests/
   test_linking.py
   test_loading.py
   test_package.py
+  test_procurement_finance_integration.py
   test_snapshot.py
+  typing/
+    valid_api.py     # assert_type cho bề mặt công khai
+    invalid_api.py   # lỗi kiểu có chủ đích, mỗi ignore phải cần thiết
 ```
 
 ## Khai báo cấu trúc
@@ -210,6 +223,18 @@ assert DefinitionKey("finance.reserve_budget", "1.0.0") in published.entries
 Mỗi `SnapshotEntry` có `dependencies` (cạnh `calls`/`reads`/`writes`/`params`/`links`/`effects` kèm identity, version và owner của đích) và `approval` dạng cây biểu thức bất biến. `ComparisonExpr.operator` giữ nguyên toán tử nên consumer phân biệt được `>` và `>=`, kể cả trong `all_of`/`any_of`/`not_`. Key tra cứu lấy từ identity đã khai báo: đổi tên class host không làm đổi identity hay lookup.
 
 Snapshot **không** công bố handler digest: sprint này chưa định nghĩa bytes và phạm vi của digest, nên không có hash tùy ý nào được gọi là digest artifact publish. Snapshot không kéo theo engine, authorization hay execution.
+
+## Ví dụ Procurement/Finance
+
+`examples/procurement_finance/` là ví dụ chạy được trên chính API công khai ở trên: hai module Procurement và Finance, `ApprovePurchaseOrder` gọi `finance.reserve_budget`, kèm approval và effect metadata. Chạy từ gốc repo:
+
+```bash
+uv run python -m examples.procurement_finance
+```
+
+Ví dụ in đường Load → Link → Snapshot rồi sáu lỗi tĩnh: `DuplicateIdentity` (Load), `NotExported`, `UnresolvedReference`, `ObjectRefMismatch`, `HandlerMismatch` (Link) và `UnsupportedApprovalExpression` (declaration). `tests/test_procurement_finance_integration.py` kiểm tra lại toàn bộ đường đi và output của entry point; `tests/typing/valid_api.py` ghim kiểu công khai, còn `tests/typing/invalid_api.py` đảm bảo Pyright vẫn bắt các lỗi kiểu có chủ đích.
+
+Không cần backend: handler chỉ là metadata và không được gọi. Hướng dẫn chạy, lỗi và non-claims chi tiết nằm ở [`examples/procurement_finance/README.md`](examples/procurement_finance/README.md).
 
 ## Quyết định đã chốt
 
