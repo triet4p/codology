@@ -25,9 +25,10 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 
 [tool.pyright]
-include = ["src", "tests"]
+include = ["src", "tests", "examples"]
 exclude = [".venv", "artifacts", "experiments"]
 typeCheckingMode = "strict"
 pythonVersion = "3.13"
