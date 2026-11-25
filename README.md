@@ -9,7 +9,8 @@ Repository đang ở Sprint 3 — Declarations & Linked Registry. Phần đã c�
 - `codology` import được từ môi trường sạch, không cần database, credential hay backend SDK.
 - `codology.declarations` cung cấp primitive cấu trúc bất biến `Module`, `ObjectType`, `Value`, `Link` và `ObjectRef[T]`: identity/version tường minh, property có kiểu, link có target/cardinality/traversal và `exports` đóng băng.
 - `codology.declarations` cung cấp `Action`, `Function`, `Effect` và predicate approval cấu trúc: `params`, `reads`/`writes`/`calls`, `permission`, `commitRequirement`, `approval` và `effects` được đóng băng lúc khai báo; không chạy handler hay đánh giá predicate.
-- Load và Link đã được triển khai; snapshot/registry công khai, binding, engine và adapter **chưa được triển khai**; các task sau trong sprint bổ sung dần.
+- Load, Link và `snapshot()` đã được triển khai; snapshot công bố graph đã link dưới dạng bất biến, tra cứu tường minh theo identity/version.
+- Deployment binding, registry bền vững, publish artifact, engine và adapter **chưa được triển khai**; các task sau trong sprint bổ sung dần.
 
 ## Yêu cầu
 
@@ -42,6 +43,7 @@ src/codology/
   py.typed
   loading.py        # Load: thu thập definition, kiểm tra identity và field
   linking.py        # Link: resolve reference, export, kind và chữ ký handler
+  snapshot.py       # Snapshot: graph đã link bất biến, lookup identity/version
   declarations/
     __init__.py
     annotations.py   # giữ annotation thô, resolve ở pha Link
@@ -56,6 +58,7 @@ tests/
   test_linking.py
   test_loading.py
   test_package.py
+  test_snapshot.py
 ```
 
 ## Khai báo cấu trúc
@@ -183,6 +186,31 @@ assert approve.hints["order"].target is PurchaseOrder
 
 Link từ chối reference không tồn tại (`UnresolvedReference`), đích sai loại (`WrongKind`), definition liên module chưa export (`NotExported`), `ObjectRef[T]` không khớp (`ObjectRefMismatch`) và handler sai quy ước/tham số (`HandlerMismatch`). Mỗi lỗi kèm module, identity và field để author sửa. Link chỉ đọc annotation và chữ ký: không gọi handler, không suy dependency từ thân handler và không cần provider hay credential.
 
+## Snapshot: graph đã link dưới dạng bất biến
+
+`snapshot()` nhận `LinkedDeclarations` và trả `Snapshot` bất biến, tách khỏi class khai báo. Sửa collection đầu vào hoặc collection lấy ra từ snapshot không làm đổi dữ liệu đã công bố. Tra cứu luôn cần identity **và** version; không có `latest` hay fallback theo identity.
+
+```python
+from codology import DefinitionKey, link, load, snapshot
+
+published = snapshot(
+    link(
+        load(
+            ModuleDeclarations(Procurement, [PurchaseOrder, Money, ApprovePurchaseOrder]),
+            ModuleDeclarations(Finance, [Budget, ReserveBudget]),
+        )
+    )
+)
+entry = published.lookup("finance.reserve_budget", "1.0.0")
+assert entry.owner == "finance" and entry.kind == "Action"
+assert published.versions_of("finance.reserve_budget") == ("1.0.0",)
+assert DefinitionKey("finance.reserve_budget", "1.0.0") in published.entries
+```
+
+Mỗi `SnapshotEntry` có `dependencies` (cạnh `calls`/`reads`/`writes`/`params`/`links`/`effects` kèm identity, version và owner của đích) và `approval` dạng cây biểu thức bất biến. `ComparisonExpr.operator` giữ nguyên toán tử nên consumer phân biệt được `>` và `>=`, kể cả trong `all_of`/`any_of`/`not_`. Key tra cứu lấy từ identity đã khai báo: đổi tên class host không làm đổi identity hay lookup.
+
+Snapshot **không** công bố handler digest: sprint này chưa định nghĩa bytes và phạm vi của digest, nên không có hash tùy ý nào được gọi là digest artifact publish. Snapshot không kéo theo engine, authorization hay execution.
+
 ## Quyết định đã chốt
 
 - **Một quy ước handler duy nhất:** `def handler(self, ctx, ...)` trên class khai báo. `@staticmethod def handle(...)` không được hỗ trợ; không có API thứ hai để giữ đồng bộ. `self` không mang execution state.
@@ -193,7 +221,7 @@ Link từ chối reference không tồn tại (`UnresolvedReference`), đích sa
 ## Giới hạn
 
 - Đây là lớp mô hình **tĩnh**. Chưa có engine `query`/`invoke`, authorization, session/Unit of Work, atomic commit, approval callback hay effect delivery.
-- Load đã thu thập definition và kiểm tra identity/field; Link đã resolve reference, kiểm tra export/kind và chữ ký handler. Snapshot/registry công khai và kiểm tra deployment binding thuộc các task kế tiếp.
+- Load đã thu thập definition và kiểm tra identity/field; Link đã resolve reference, kiểm tra export/kind và chữ ký handler; snapshot đã công bố graph bất biến với lookup tường minh. Deployment binding, registry bền vững và publish artifact thuộc các task kế tiếp.
 - Predicate approval chỉ được lưu dạng cấu trúc; chưa có đánh giá ngưỡng, callback duyệt hay giao effect. `Function` dùng cùng quy ước `handler(self, ctx, ...)` với `Action` theo implementation baseline.
 - Không có tuyên bố `ATOMIC`, authorization hay execution đã hoạt động. Metadata `ATOMIC` được lưu trong mô hình (khi có) không chứng minh backend đáp ứng atomicity.
 - Static validation không phát hiện truy cập ẩn trong thân handler (import lén, `getattr` động, đọc file/socket). Đó là rủi ro đã ghi nhận, xử lý bằng review và test.
