@@ -10,6 +10,7 @@ Bộ tài liệu này được tách từ bản tổng hợp [`init.md`](../rese
 
 - **Đọc trước: [Architecture Direction](design/architecture-direction.md).** Thiết kế khuyến nghị ở mức kiến trúc: business layer chịu trách nhiệm gì, nằm ở đâu và có thể hứa điều gì với ứng dụng.
 - Khi bắt đầu triển khai: [Framework Design v0.1](design/framework-design-v0.1.md) và [Atomic Approval Evidence](design/atomic-approval-evidence.md) là phụ lục kỹ thuật, không phải API đã chốt.
+- **Hợp đồng author (Nấc 1–2):** [Developer Contract](design/developer-contract.md) — khai báo tối thiểu cho action đồng bộ đơn module, leo thang liên module nguyên tử `Procurement` → `Finance` bằng thuộc tính cộng thêm, bề mặt `HandlerCtx`/scoped UoW và ma trận lỗi load/link/binding.
 
 ## Architecture Deep Dives
 
