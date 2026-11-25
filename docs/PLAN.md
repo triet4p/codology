@@ -2,6 +2,8 @@
 
 Mục tiêu: developer khai báo mô hình và hành vi nghiệp vụ một lần; ứng dụng đọc dữ liệu và gọi Action theo cùng hợp đồng, không tự viết lại luật phân quyền hay điều phối giao dịch. Dùng ca duyệt đơn mua hàng làm ví dụ xuyên suốt, rồi kiểm tra khả năng tái sử dụng ngoài ca này.
 
+Package Python gốc của framework là `codology`; Ontology as Code (OaC) là tên khái niệm, không phải tên package. Cấu trúc package con sẽ được thiết kế chi tiết khi triển khai.
+
 ## Milestones
 
 Mỗi sprint tương ứng một milestone. Sprint 1 và Sprint 2 đã hoàn tất; các mốc còn lại là thứ tự đề xuất. Mỗi dòng mô tả kết quả ở cuối sprint, không phải danh sách task.

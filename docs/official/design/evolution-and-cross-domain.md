@@ -579,7 +579,7 @@ Tiêu chí đổi lựa chọn, phải quan sát được:
 ### 4.6 Ánh xạ vào `declarations/` và `registry/`
 
 ```text
-oac/
+codology/
   declarations/
     base.py        # Module, ObjectType, Value, Link, Function, Action, Effect
     expression.py  # Param + toán tử cấu trúc (không nhận Python callable)
@@ -594,6 +594,7 @@ oac/
 
 Luật của lớp này:
 
+- Package Python gốc là `codology`; `declarations/` và `registry/` là các package con dự kiến cho Sprint 3. Tên gọi *Ontology as Code* (OaC) vẫn dùng cho khái niệm, không phải tên package.
 - `declarations/` không import `registry/`, `engine/`, adapter hay backend.
 - `registry/` không chạy handler và không đọc dữ liệu nghiệp vụ; nó chỉ đọc declaration.
 - `Money`/`Duration` có thể ship ở `values.py` hoặc khai báo trong miền như mục 3.2; cả hai đều là Value thường, không phải core primitive. Miền tự định nghĩa Value của mình vẫn hợp lệ nếu có `comparisonUnit`.

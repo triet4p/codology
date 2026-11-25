@@ -220,6 +220,8 @@ Tuy nhiên, đây là quyết định tạm thời để giảm complexity của
 
 Một package structure có thể được hình dung như sau:
 
+**Cập nhật:** Cây bên dưới là minh họa nền tảng được giữ lại; package Python gốc đã được thống nhất là `codology`, không phải `ontology`. Xem [thiết kế package hiện hành](design/evolution-and-cross-domain.md#46-ánh-xạ-vào-declarations-và-registry).
+
 **ontology-framework/**
 
 src/

@@ -177,7 +177,7 @@ Gộp `DENIED` với `REJECTED` hoặc gộp effect lỗi vào execution `FAILED
 Seams đề xuất (bám port ở mục 4; định nghĩa port sống trong core):
 
 ```text
-oac/
+codology/
   declarations/   # Action, ObjectType, Module, Function, Query, Approval expression
   registry/       # composition, load/link, immutable snapshot, introspect
   binding/        # deployment binding, capability + enlistment plan check
@@ -185,6 +185,8 @@ oac/
   ports/          # định nghĩa port do core sở hữu (DataProvider, TransactionProvider, ...)
   adapters_pg/    # thực thi port cho PostgreSQL: guarded debit, outbox cùng session
 ```
+
+Tên package Python gốc là `codology`; OaC là viết tắt của khái niệm Ontology as Code. Các package con và thứ tự dưới đây là đề xuất thiết kế, không phải code đã triển khai.
 
 Thứ tự thực hiện (mỗi bước có acceptance + negative):
 
