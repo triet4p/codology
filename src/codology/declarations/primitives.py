@@ -24,7 +24,25 @@ Traversal = Literal["navigable", "internal"]
 _CARDINALITIES: Final = frozenset({"one", "many"})
 _TRAVERSALS: Final = frozenset({"navigable", "internal"})
 _METADATA_NAMES: Final = frozenset(
-    {"identity", "version", "exports", "keyType", "links", "properties"}
+    {
+        "identity",
+        "version",
+        "exports",
+        "keyType",
+        "links",
+        "properties",
+        "params",
+        "reads",
+        "writes",
+        "calls",
+        "permission",
+        "commitRequirement",
+        "approval",
+        "effects",
+        "result",
+        "payload",
+        "dedupKey",
+    }
 )
 
 
