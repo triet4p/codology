@@ -12,6 +12,7 @@ Bộ tài liệu này được tách từ bản tổng hợp [`init.md`](../rese
 - Khi bắt đầu triển khai: [Framework Design v0.1](design/framework-design-v0.1.md) và [Atomic Approval Evidence](design/atomic-approval-evidence.md) là phụ lục kỹ thuật, không phải API đã chốt.
 - **Hợp đồng author (Nấc 1–3):** [Developer Contract](design/developer-contract.md) — khai báo tối thiểu cho action đồng bộ đơn module, leo thang liên module nguyên tử `Procurement` → `Finance`, rồi leo thang quản trị bất đồng bộ (`approval`, resume trên manifest ghim, `effects` outbox) bằng thuộc tính cộng thêm; bề mặt `HandlerCtx`/scoped UoW và ma trận lỗi load/link/binding.
 - **Hợp đồng consumer (Nấc 1–3):** [Consumer Contract](design/consumer-contract.md) — luồng `query → ObjectRef[T] → invoke` qua cùng cửa policy, envelope `ActionResult`/`ExecutionRecord` cho `COMMITTED` và `AWAITING_APPROVAL`, callback `approve`/`reject`, `reconcile`, quan sát `Effect` và ma trận hành động cho từng mã kết quả/lỗi.
+- **Tiến hóa và tái sử dụng đa miền (Nấc 4):** [Evolution & Cross-Domain Validation](design/evolution-and-cross-domain.md) — bảng quyết định `PATCH`/`MINOR`/`MAJOR` với semantic diff cho `1.0.0 → 1.1.0 → 2.0.0`, quy tắc pin manifest và rollback; kiểm chứng Author + Consumer contract trên miền cấp quyền hạ tầng nhạy cảm mà không thêm primitive nào; khuyến nghị bề mặt khai báo Python class-based cho `declarations/` và `registry/`.
 
 ## Architecture Deep Dives
 

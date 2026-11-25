@@ -1,6 +1,6 @@
 # Consumer Contract
 
-*Đặc tả bề mặt người gọi cho OaC: Web app, CLI/automation và AI agent/MCP đi qua **một** cửa engine để đọc và để ghi. Phạm vi: ba nấc của `ApprovePurchaseOrder` — `1.0.0` đồng bộ đơn module, `1.1.0` liên module nguyên tử, `2.0.0` chờ duyệt + effect. Mọi code là minh họa hợp đồng, chưa phải syntax cuối. Phần author thuộc [`developer-contract.md`](./developer-contract.md); quy tắc tiến hóa version thuộc tài liệu versioning.*
+*Đặc tả bề mặt người gọi cho OaC: Web app, CLI/automation và AI agent/MCP đi qua **một** cửa engine để đọc và để ghi. Phạm vi: ba nấc của `ApprovePurchaseOrder` — `1.0.0` đồng bộ đơn module, `1.1.0` liên module nguyên tử, `2.0.0` chờ duyệt + effect. Mọi code là minh họa hợp đồng, chưa phải syntax cuối. Phần author thuộc [`developer-contract.md`](./developer-contract.md); quy tắc tiến hóa version và semantic diff thuộc [`evolution-and-cross-domain.md`](./evolution-and-cross-domain.md).*
 
 ## 1. Bề mặt thống nhất và ba thực thể
 
@@ -243,10 +243,11 @@ Ba nhầm lẫn bị bảng này cấm: gộp `DENIED` với `REJECTED`, coi `UN
 
 ## 6. Ranh giới và liên kết
 
-- Không nằm ở đây: cách author khai báo `approval`/`effects`, nội dung `HandlerCtx`, lỗi Load/Link/binding của author, và bảng SemVer cho `1.0 → 1.1 → 2.0`.
+- Không nằm ở đây: cách author khai báo `approval`/`effects`, nội dung `HandlerCtx`, lỗi Load/Link/binding của author, và bảng SemVer cho `1.0 → 1.1 → 2.0`. Các phần đó thuộc [Developer Contract](./developer-contract.md) và [Evolution & Cross-Domain Validation](./evolution-and-cross-domain.md).
 - Không thêm primitive mới: `query`, `invoke`, `approve`, `reject`, `reconcile` chỉ là cửa của engine lên meta-model v0.1 đã chốt.
 
 - [Developer Contract](./developer-contract.md) — author khai báo gì, `HandlerCtx`, scoped UoW và ma trận lỗi tĩnh.
+- [Evolution & Cross-Domain Validation](./evolution-and-cross-domain.md) — bảng SemVer, semantic diff mẫu, nhánh `AWAITING_APPROVAL` khi tiến hóa và kiểm chứng consumer contract ngoài Procurement/Finance.
 - [Framework Design v0.1](./framework-design-v0.1.md) — meta-model, pin manifest, idempotency và ma trận lỗi nền.
 - [Action Contract and Business Workflow](../deep-dives/03-action-contract-and-business-workflow.md) — authority, material intent, callback bị từ chối và `UNKNOWN`.
 - [Engine Boundary and Adapter Capabilities](../deep-dives/04-engine-boundary-and-adapter-capabilities.md) — enlistment, outbox/relay và hiệu lực của `NoSharedTransaction`.

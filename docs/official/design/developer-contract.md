@@ -17,9 +17,9 @@ Nguyên tắc xuyên suốt là **progressive disclosure**: mỗi nấc chỉ **
 | 1 | `ObjectType`, `Action` (`params`, `reads`, `writes`, `permission`, `handler`) | Một UoW trên một resource, authorization live, audit | Đặc tả trong tài liệu này (mục 3.1) |
 | 2 | `+ reads` liên module, `calls`, `commitRequirement = ATOMIC`; `Module.exports` | Link cross-module, ủy quyền thu hẹp, một enlisted session vật lý | Đặc tả trong tài liệu này (mục 3.2) |
 | 3 | `approval`, `effects`, `ctx.uow.enqueue_effect` | Treo/tiếp tục execution trên manifest ghim, revalidate live khi resume, outbox cùng enlisted session | Đặc tả trong tài liệu này (mục 4) |
-| 4 | Không thêm primitive; chỉ đổi version/ngữ nghĩa | Semantic diff, pin manifest, compat | Ngoài phạm vi: quy tắc versioning thuộc tài liệu tiến hóa |
+| 4 | Không thêm primitive; chỉ đổi version/ngữ nghĩa | Semantic diff, pin manifest, compat | Ngoài phạm vi: quy tắc versioning thuộc [Evolution & Cross-Domain Validation](./evolution-and-cross-domain.md) |
 
-Ví dụ xuyên suốt: `procurement.approve_purchase_order` (viết tắt `ApprovePurchaseOrder`) leo `1.0.0 → 1.1.0` khi cần giữ ngân sách thuộc `finance`, rồi `1.1.0 → 2.0.0` khi cần người khác duyệt theo ngưỡng và phát effect sau commit. Hợp đồng người gọi (`query`/`invoke`/`approve`/`reconcile`) nằm ở [Consumer Contract](./consumer-contract.md); quy tắc versioning thuộc tài liệu tiến hóa.
+Ví dụ xuyên suốt: `procurement.approve_purchase_order` (viết tắt `ApprovePurchaseOrder`) leo `1.0.0 → 1.1.0` khi cần giữ ngân sách thuộc `finance`, rồi `1.1.0 → 2.0.0` khi cần người khác duyệt theo ngưỡng và phát effect sau commit. Hợp đồng người gọi (`query`/`invoke`/`approve`/`reconcile`) nằm ở [Consumer Contract](./consumer-contract.md); bảng SemVer, semantic diff và quy tắc rollout thuộc [Evolution & Cross-Domain Validation](./evolution-and-cross-domain.md).
 
 ## 2. Nguyên thủy khai báo và mặc định sở hữu
 
@@ -77,7 +77,7 @@ class PurchaseOrder(ObjectType):
 - Property luôn có kiểu; `required` và `comparisonUnit` chỉ khai báo khi contract cần. Core không hard-code ngưỡng tiền, vai trò Finance hay quy tắc Procurement.
 - `Link` gồm `name`, `target`, `cardinality` (`one` | `many`), `traversal` (`navigable` | `internal`). Chỉ `navigable` mới đi qua query boundary; `internal` không lộ ra ngoài module.
 - Khai báo link hoặc export **không** cấp quyền đọc. Cạnh `budget` tồn tại từ `1.0.0` nhưng Nấc 1 không đọc được `Budget` vì `reads` của action không chứa nó.
-- Thêm property/link là thay đổi khai báo; xếp hạng PATCH/MINOR/MAJOR thuộc tài liệu tiến hóa (Nấc 4), không quyết định ở đây.
+- Thêm property/link là thay đổi khai báo; xếp hạng PATCH/MINOR/MAJOR thuộc [Evolution & Cross-Domain Validation](./evolution-and-cross-domain.md) (Nấc 4), không quyết định ở đây.
 
 ### 2.3 ObjectRef và Function
 
@@ -286,7 +286,7 @@ Hệ quả bắt buộc của Nấc 2:
 
 ### 3.3 Ranh giới Nấc 3 và Nấc 4
 
-Nấc 3 bổ sung `approval` và `effects`, đặc tả ở mục 4. Nấc 4 bổ sung quy tắc version và pin, ngoài phạm vi tài liệu này. Cả hai chỉ **thêm** khai báo (thuộc tính Action và declaration effect), không đổi cấu trúc cốt lõi: `params`, `reads`, `writes`, `calls`, `permission` và chữ ký `handler(ctx, ...)` của Nấc 1–2 giữ nguyên — mục 4.1 chứng minh bằng diff.
+Nấc 3 bổ sung `approval` và `effects`, đặc tả ở mục 4. Nấc 4 bổ sung quy tắc version và pin, đặc tả ở [Evolution & Cross-Domain Validation](./evolution-and-cross-domain.md). Cả hai chỉ **thêm** khai báo (thuộc tính Action và declaration effect), không đổi cấu trúc cốt lõi: `params`, `reads`, `writes`, `calls`, `permission` và chữ ký `handler(ctx, ...)` của Nấc 1–2 giữ nguyên — mục 4.1 chứng minh bằng diff.
 
 ## 4. Nấc 3 — quản trị bất đồng bộ: `approval`, resume, `effects`
 
@@ -560,7 +560,7 @@ Hợp đồng giao sau commit:
 
 - **Không thêm primitive.** `approval` và `effects` là trường đã có trong meta-model v0.1 của Action; `Effect` chỉ là hình dạng phần tử `effects[]`, không có vòng đời riêng và không phải node mới.
 - **Consumer contract tách riêng.** Cấu trúc `ActionResult`/`ExecutionRecord`, dữ liệu trả về ở `AWAITING_APPROVAL`, hợp đồng `query`/`invoke`/`approve`/`reconcile` và ma trận kết quả/lỗi thuộc [Consumer Contract](./consumer-contract.md); mục này chỉ chốt phần author nhìn thấy.
-- **Versioning tách riêng.** Khi nào thêm `approval`/`effects` buộc MINOR hay MAJOR (ví dụ đổi action đồng bộ thành có `AWAITING_APPROVAL`) thuộc tài liệu tiến hóa.
+- **Versioning tách riêng.** Khi nào thêm `approval`/`effects` buộc MINOR hay MAJOR (ví dụ đổi action đồng bộ thành có `AWAITING_APPROVAL`) thuộc [Evolution & Cross-Domain Validation](./evolution-and-cross-domain.md).
 - **Provider capability thuộc engine boundary.** Declaration có `effects` mà binding không cung cấp outbox cùng session và `effectDedup` thì deployment binding từ chối trước khi chạy (`EffectContractUnsupported`), không downgrade lặng lẽ.
 
 ## 5. HandlerCtx và scoped Unit of Work
@@ -653,6 +653,7 @@ Ngoài phạm vi tài liệu này: an toàn đọc/query (`UnsupportedSecureQuer
 - [Architecture Direction](./architecture-direction.md) — nguyên tắc module sở hữu nghiệp vụ, quyền không tự tăng qua ranh giới module.
 - [Framework Design v0.1](./framework-design-v0.1.md) — meta-model compact, `HandlerCtx`, scoped UoW, strict atomic, pin manifest và ma trận lỗi đầy đủ.
 - [Consumer Contract](./consumer-contract.md) — bề mặt `query`/`invoke`/`approve`/`reconcile`, ba thực thể, envelope `COMMITTED`/`AWAITING_APPROVAL`, callback/re-approval và ma trận hành động consumer.
+- [Evolution & Cross-Domain Validation](./evolution-and-cross-domain.md) — bảng quyết định PATCH/MINOR/MAJOR, semantic diff mẫu, rollout cho execution đang treo, kiểm chứng đa miền và bề mặt khai báo Python.
 - [Static Architecture and Definition Lifecycle](../deep-dives/01-static-architecture-and-definition-lifecycle.md) — load/link/binding, identity vs host name, exports, undeclared dependency.
 - [Developer Workflow and Model Evolution](../deep-dives/02-developer-workflow-and-model-evolution.md) — ngưỡng `>`/`>=`, tiền tệ và cách semantic diff phân loại thay đổi.
 - [Action Contract and Business Workflow](../deep-dives/03-action-contract-and-business-workflow.md) — `DENIED`/`REJECTED`/`AWAITING_APPROVAL`, authority, material intent và ủy quyền thu hẹp.
