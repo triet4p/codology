@@ -9,7 +9,7 @@ Repository đang ở Sprint 3 — Declarations & Linked Registry. Phần đã c�
 - `codology` import được từ môi trường sạch, không cần database, credential hay backend SDK.
 - `codology.declarations` cung cấp primitive cấu trúc bất biến `Module`, `ObjectType`, `Value`, `Link` và `ObjectRef[T]`: identity/version tường minh, property có kiểu, link có target/cardinality/traversal và `exports` đóng băng.
 - `codology.declarations` cung cấp `Action`, `Function`, `Effect` và predicate approval cấu trúc: `params`, `reads`/`writes`/`calls`, `permission`, `commitRequirement`, `approval` và `effects` được đóng băng lúc khai báo; không chạy handler hay đánh giá predicate.
-- Load đã được triển khai; Link, snapshot, binding, engine và adapter **chưa được triển khai**; các task sau trong sprint bổ sung dần.
+- Load và Link đã được triển khai; snapshot/registry công khai, binding, engine và adapter **chưa được triển khai**; các task sau trong sprint bổ sung dần.
 
 ## Yêu cầu
 
@@ -41,6 +41,7 @@ src/codology/
   __init__.py
   py.typed
   loading.py        # Load: thu thập definition, kiểm tra identity và field
+  linking.py        # Link: resolve reference, export, kind và chữ ký handler
   declarations/
     __init__.py
     annotations.py   # giữ annotation thô, resolve ở pha Link
@@ -52,6 +53,7 @@ tests/
   test_behavior.py
   test_declarations.py
   test_handler.py
+  test_linking.py
   test_loading.py
   test_package.py
 ```
@@ -160,7 +162,26 @@ assert reserved.owner == "finance" and reserved.version == "1.0.0"
 
 Load từ chối identity trùng (`DuplicateIdentity`) và field khai báo không hợp lệ (`UnknownDeclarationKey`). Cả hai lỗi đều kèm module, identity và field để author sửa; một field gõ nhầm trong thân class bị từ chối thay vì bị bỏ qua. Identity luôn lấy từ `identity` đã khai báo, không suy từ tên class: hai class cùng tên `Budget` nhưng identity khác nhau load được bình thường, và `Value` không khai identity giữ `identity = None`. Collection đầu vào được sao chép tại Load; sửa chúng sau đó không làm đổi kết quả.
 
-Load **không** resolve reference, kiểm tra export hay gọi handler; các việc đó thuộc Link và các pha sau.
+Load **không** resolve reference, kiểm tra export hay gọi handler; các việc đó thuộc Link.
+
+## Link: resolve và kiểm tra ranh giới module
+
+`link` nhận `LoadedDeclarations` từ Load và trả `LinkedDeclarations` bất biến: mỗi definition có annotation đã resolve, chữ ký handler đã đối chiếu và các cạnh reference đã kiểm tra. Namespace được compose từ mọi definition tham gia link, nên hai module có thể tham chiếu kiểu của nhau bằng forward annotation mà không import vòng lúc chạy.
+
+```python
+from codology import ModuleDeclarations, link, load
+
+linked = link(
+    load(
+        ModuleDeclarations(Procurement, [PurchaseOrder, ApprovePurchaseOrder]),
+        ModuleDeclarations(Finance, [Budget, ReserveBudget]),
+    )
+)
+approve = linked.definitions["procurement.approve_purchase_order"]
+assert approve.hints["order"].target is PurchaseOrder
+```
+
+Link từ chối reference không tồn tại (`UnresolvedReference`), đích sai loại (`WrongKind`), definition liên module chưa export (`NotExported`), `ObjectRef[T]` không khớp (`ObjectRefMismatch`) và handler sai quy ước/tham số (`HandlerMismatch`). Mỗi lỗi kèm module, identity và field để author sửa. Link chỉ đọc annotation và chữ ký: không gọi handler, không suy dependency từ thân handler và không cần provider hay credential.
 
 ## Quyết định đã chốt
 
@@ -172,7 +193,7 @@ Load **không** resolve reference, kiểm tra export hay gọi handler; các vi�
 ## Giới hạn
 
 - Đây là lớp mô hình **tĩnh**. Chưa có engine `query`/`invoke`, authorization, session/Unit of Work, atomic commit, approval callback hay effect delivery.
-- Load đã thu thập definition và kiểm tra identity/field; Link, registry và kiểm tra export/reference liên module thuộc các task kế tiếp của Sprint 3.
+- Load đã thu thập definition và kiểm tra identity/field; Link đã resolve reference, kiểm tra export/kind và chữ ký handler. Snapshot/registry công khai và kiểm tra deployment binding thuộc các task kế tiếp.
 - Predicate approval chỉ được lưu dạng cấu trúc; chưa có đánh giá ngưỡng, callback duyệt hay giao effect. `Function` dùng cùng quy ước `handler(self, ctx, ...)` với `Action` theo implementation baseline.
 - Không có tuyên bố `ATOMIC`, authorization hay execution đã hoạt động. Metadata `ATOMIC` được lưu trong mô hình (khi có) không chứng minh backend đáp ứng atomicity.
 - Static validation không phát hiện truy cập ẩn trong thân handler (import lén, `getattr` động, đọc file/socket). Đó là rủi ro đã ghi nhận, xử lý bằng review và test.

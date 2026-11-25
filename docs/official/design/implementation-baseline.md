@@ -63,7 +63,7 @@ uv run ruff format --check .
 
 ## 6. Giới hạn và non-claims
 
-- Load (`codology.loading.load`) thu thập definition theo ownership, giữ identity/version và từ chối identity trùng cùng field lạ; Link/registry chưa có nên chưa có kiểm tra export hay reference.
+- Load (`codology.loading.load`) thu thập definition theo ownership, giữ identity/version và từ chối identity trùng cùng field lạ; Link (`codology.linking.link`) resolve reference, kiểm tra export/kind và đối chiếu chữ ký handler. Snapshot/registry công khai và deployment binding chưa có.
 - Không có engine, authorization, UoW, atomic commit, approval callback, effect delivery hay adapter.
 - Metadata `ATOMIC` trong mô hình không chứng minh backend đáp ứng atomicity; không có digest artifact publish.
 - Static validation không phát hiện truy cập ẩn trong thân handler (import lén, `getattr` động, file/socket). Đây là rủi ro đã ghi nhận, không phải năng lực đã có.
