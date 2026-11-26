@@ -1,11 +1,38 @@
 """Codology's import root.
 
-The package ships the static declaration layer, Load, Link, and an immutable
-snapshot view. Binding, engine, and adapter modules do not exist yet;
-importing ``codology`` must never require a database, credentials, or a
-backend SDK.
+The package ships the static declaration layer, Load, Link, an immutable
+snapshot view, and deployment binding. Binding validates a deployment plan
+against a published graph without calling a handler or opening a transaction;
+engine and adapter modules do not exist yet. Importing ``codology`` must never
+require a database, credentials, or a backend SDK.
 """
 
+from codology.binding import (
+    AmbientServiceIdentity,
+    AmbiguousEnlistment,
+    BindingError,
+    BoundAction,
+    BoundCall,
+    BoundDelegation,
+    BoundWrite,
+    Capability,
+    DelegationError,
+    DelegationGrant,
+    DelegationPrincipal,
+    Deployment,
+    Enlistment,
+    InconsistentSession,
+    MissingCapability,
+    NoSharedTransaction,
+    NotAnAction,
+    PermissionBroadened,
+    Provider,
+    SessionPlan,
+    UnboundWrite,
+    UndeclaredCall,
+    UnknownProvider,
+    bind_action,
+)
 from codology.linking import (
     HandlerMismatch,
     LinkedDeclarations,
@@ -49,15 +76,29 @@ __version__ = "0.1.0"
 
 __all__ = [
     "AllOfExpr",
+    "AmbientServiceIdentity",
+    "AmbiguousEnlistment",
     "AnyOfExpr",
     "ApprovalView",
+    "BindingError",
+    "BoundAction",
+    "BoundCall",
+    "BoundDelegation",
+    "BoundWrite",
+    "Capability",
     "ComparisonExpr",
     "DefinitionKey",
+    "DelegationError",
+    "DelegationGrant",
+    "DelegationPrincipal",
     "Dependency",
+    "Deployment",
     "DuplicateIdentity",
+    "Enlistment",
     "Expression",
     "FieldPath",
     "HandlerMismatch",
+    "InconsistentSession",
     "LinkError",
     "LinkedDeclarations",
     "LinkedDefinition",
@@ -66,18 +107,28 @@ __all__ = [
     "LoadedModule",
     "LoadError",
     "LiteralValue",
+    "MissingCapability",
     "ModuleDeclarations",
+    "NoSharedTransaction",
+    "NotAnAction",
     "NotExported",
     "NotExpr",
     "ObjectRefMismatch",
+    "PermissionBroadened",
+    "Provider",
     "ResolvedReference",
+    "SessionPlan",
     "Snapshot",
     "SnapshotEntry",
+    "UnboundWrite",
+    "UndeclaredCall",
     "UnresolvedReference",
     "UnknownDeclarationKey",
     "UnknownDefinition",
+    "UnknownProvider",
     "WrongKind",
     "__version__",
+    "bind_action",
     "link",
     "load",
     "snapshot",

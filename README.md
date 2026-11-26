@@ -4,14 +4,15 @@ Codology (Ontology as Code) là lớp mô hình tĩnh cho phép developer khai b
 
 ## Trạng thái
 
-Repository đang ở Sprint 3 — Declarations & Linked Registry. Phần đã có là project scaffold và hạ tầng khai báo tĩnh:
+Repository đang ở Sprint 4 — Lát cắt thực thi nguyên tử. Phần đã có là project scaffold, hạ tầng khai báo tĩnh và deployment binding ở mức plan:
 
 - `codology` import được từ môi trường sạch, không cần database, credential hay backend SDK.
 - `codology.declarations` cung cấp primitive cấu trúc bất biến `Module`, `ObjectType`, `Value`, `Link` và `ObjectRef[T]`: identity/version tường minh, property có kiểu, link có target/cardinality/traversal và `exports` đóng băng.
 - `codology.declarations` cung cấp `Action`, `Function`, `Effect` và predicate approval cấu trúc: `params`, `reads`/`writes`/`calls`, `permission`, `commitRequirement`, `approval` và `effects` được đóng băng lúc khai báo; không chạy handler hay đánh giá predicate.
 - Load, Link và `snapshot()` đã được triển khai; snapshot công bố graph đã link dưới dạng bất biến, tra cứu tường minh theo identity/version.
 - Ví dụ Procurement/Finance chạy được trên API thật (`examples/procurement_finance/`) cùng kiểm thử tích hợp và kiểm tra typing cho cả đường thành công lẫn lỗi tĩnh.
-- Deployment binding, registry bền vững, publish artifact, engine và adapter **chưa được triển khai**; các task sau trong sprint bổ sung dần.
+- `bind_action()` kiểm tra deployment plan cho action `ATOMIC`: capability của provider, write set bắc cầu qua `calls`, một session enlist chung và mapping ủy quyền không rộng hơn contract; không gọi handler và không mở transaction.
+- Engine `query`/`invoke`, adapter transaction thật, authorization runtime, registry bền vững và publish artifact **chưa được triển khai**; các task sau trong sprint bổ sung dần.
 
 ## Yêu cầu
 
@@ -46,6 +47,7 @@ src/codology/
   loading.py        # Load: thu thập definition, kiểm tra identity và field
   linking.py        # Link: resolve reference, export, kind và chữ ký handler
   snapshot.py       # Snapshot: graph đã link bất biến, lookup identity/version
+  binding.py        # Deployment binding: capability, write set, enlistment plan
   declarations/
     __init__.py
     annotations.py   # giữ annotation thô, resolve ở pha Link
@@ -62,6 +64,7 @@ examples/procurement_finance/
 tests/
   test_annotations.py
   test_behavior.py
+  test_binding.py
   test_declarations.py
   test_handler.py
   test_linking.py
@@ -224,6 +227,57 @@ Mỗi `SnapshotEntry` có `dependencies` (cạnh `calls`/`reads`/`writes`/`param
 
 Snapshot **không** công bố handler digest: sprint này chưa định nghĩa bytes và phạm vi của digest, nên không có hash tùy ý nào được gọi là digest artifact publish. Snapshot không kéo theo engine, authorization hay execution.
 
+## Deployment binding: kiểm tra plan cho `ATOMIC`
+
+`bind_action()` ghép một action version cụ thể trong `Snapshot` với `Deployment` gồm `Provider`, `Enlistment` và `DelegationGrant`. Đây là kiểm tra **plan**: không gọi handler, không mở transaction và không chứng minh session vật lý đang mở. Runtime vẫn phải xác nhận transaction thật trước khi commit.
+
+```python
+from codology import (
+    Capability,
+    DefinitionKey,
+    DelegationGrant,
+    Deployment,
+    Enlistment,
+    Provider,
+    bind_action,
+)
+
+deployment = Deployment(
+    providers=(Provider("orders-db", "sqlite", frozenset({Capability.ATOMIC_TRANSACTION})),),
+    enlistments=(
+        Enlistment("procurement.purchase_order", "orders-db", "sqlite:main"),
+        Enlistment("finance.budget", "orders-db", "sqlite:main"),
+    ),
+    delegations=(
+        DelegationGrant(
+            caller="procurement.approve_purchase_order",
+            call="finance.reserve_budget",
+            permission="budget.reserve",
+        ),
+    ),
+)
+bound = bind_action(
+    published,
+    deployment,
+    DefinitionKey("procurement.approve_purchase_order", "2.0.0"),
+)
+assert bound.session is not None
+assert bound.session.session == "sqlite:main"
+assert {write.resource.identity for write in bound.writes} == {
+    "procurement.purchase_order",
+    "finance.budget",
+}
+```
+
+Binding kiểm tra bốn điều:
+
+- Provider của mọi write bắt buộc phải khai báo `Capability.ATOMIC_TRANSACTION` khi action hoặc một child reachable qua `calls` có `commitRequirement = CommitRequirement.ATOMIC`; thiếu thì `MissingCapability`.
+- Write set là **bắc cầu**: `writes` của action cộng `writes` của mọi action/function reachable qua `calls`. Resource chưa enlist bị `UnboundWrite`, kể cả write chỉ do child khai báo.
+- Mọi write bắt buộc phải cùng một `Enlistment.session`. Hai enlistment độc lập — dù cùng provider kind hay cùng nhãn DB — bị `NoSharedTransaction`; cùng session label do hai provider khai báo bị `InconsistentSession`.
+- `DelegationGrant` là tùy chọn, nhưng nếu có cho một caller reachable thì phải khớp một call `Action` đã khai báo (`UndeclaredCall`), dùng principal `requester` chứ không phải service identity (`AmbientServiceIdentity`), và lặp đúng `permission` của child (`PermissionBroadened`). Không có grant nghĩa là engine dùng quyền live của requester; grant không thể mở rộng quyền.
+
+`BoundAction` trả `writes` kèm `via` (đường đi từ root qua `calls`), `calls`, `delegations` và `session` — plan một session dùng cho UoW. Metadata `ATOMIC` đã bind **không** chứng minh backend đáp ứng atomicity; phần đó thuộc adapter và kiểm chứng runtime.
+
 ## Ví dụ Procurement/Finance
 
 `examples/procurement_finance/` là ví dụ chạy được trên chính API công khai ở trên: hai module Procurement và Finance, `ApprovePurchaseOrder` gọi `finance.reserve_budget`, kèm approval và effect metadata. Chạy từ gốc repo:
@@ -245,15 +299,15 @@ Không cần backend: handler chỉ là metadata và không được gọi. Hư�
 
 ## Giới hạn
 
-- Đây là lớp mô hình **tĩnh**. Chưa có engine `query`/`invoke`, authorization, session/Unit of Work, atomic commit, approval callback hay effect delivery.
-- Load đã thu thập definition và kiểm tra identity/field; Link đã resolve reference, kiểm tra export/kind và chữ ký handler; snapshot đã công bố graph bất biến với lookup tường minh. Deployment binding, registry bền vững và publish artifact thuộc các task kế tiếp.
+- Đây vẫn là lớp mô hình tĩnh cộng deployment binding plan-check. Chưa có engine `query`/`invoke`, authorization, session/Unit of Work, atomic commit, approval callback hay effect delivery.
+- Load đã thu thập definition và kiểm tra identity/field; Link đã resolve reference, kiểm tra export/kind và chữ ký handler; snapshot đã công bố graph bất biến với lookup tường minh; `bind_action()` đã kiểm tra capability, write set và enlistment plan trên snapshot. Adapter transaction thật, registry bền vững và publish artifact thuộc các task kế tiếp.
 - Predicate approval chỉ được lưu dạng cấu trúc; chưa có đánh giá ngưỡng, callback duyệt hay giao effect. `Function` dùng cùng quy ước `handler(self, ctx, ...)` với `Action` theo implementation baseline.
-- Không có tuyên bố `ATOMIC`, authorization hay execution đã hoạt động. Metadata `ATOMIC` được lưu trong mô hình (khi có) không chứng minh backend đáp ứng atomicity.
-- Static validation không phát hiện truy cập ẩn trong thân handler (import lén, `getattr` động, đọc file/socket). Đó là rủi ro đã ghi nhận, xử lý bằng review và test.
+- Không có tuyên bố runtime `ATOMIC`, authorization hay execution đã hoạt động. Binding chỉ chứng minh plan khai báo đủ capability và một session enlist; nó không mở transaction, không xác nhận session vật lý đang mở và không chứng minh backend atomicity.
+- Static validation không phát hiện truy cập ẩn trong thân handler (import lén, `getattr` động, đọc file/socket). Binding chỉ kiểm tra mapping khai báo; nó không phát hiện host code tự mở connection hoặc dùng credential ambient ngoài plan và không sandbox handler. Đó là rủi ro đã ghi nhận, xử lý bằng review và test.
 
 ## Tài liệu
 
-- [Sprint 3 plan](docs/sprint-plans/sprint-3.md)
+- [Sprint 4 plan](docs/sprint-plans/sprint-4.md)
 - [Implementation baseline](docs/official/design/implementation-baseline.md)
 - [Developer Contract](docs/official/design/developer-contract.md)
 - [Framework Design v0.1](docs/official/design/framework-design-v0.1.md)
