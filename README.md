@@ -10,6 +10,7 @@ Sprint 4 đã hoàn tất với lát cắt thực thi nguyên tử đồng bộ.
 - `codology.declarations` cung cấp primitive cấu trúc bất biến `Module`, `ObjectType`, `Value`, `Link` và `ObjectRef[T]`: identity/version tường minh, property có kiểu, link có target/cardinality/traversal và `exports` đóng băng.
 - `codology.declarations` cung cấp `Action`, `Function`, `Effect` và predicate approval cấu trúc: `params`, `reads`/`writes`/`calls`, `permission`, `commitRequirement`, `approval` và `effects` được đóng băng lúc khai báo; không chạy handler hay đánh giá predicate.
 - Load, Link và `snapshot()` đã được triển khai; snapshot công bố graph đã link dưới dạng bất biến, tra cứu tường minh theo identity/version.
+- `pin_manifest()` / `resolve_manifest()` định nghĩa một manifest bền vững cho logic của execution: root Action, child Action/Function, effect và ontology revision đã khai báo, mỗi revision kèm digest SHA-256 của source module thực sự nạp. Host giữ nhiều revision set vẫn phân giải đúng revision đã ghim, không dùng default/latest; artifact thiếu, byte đổi, kind đổi hoặc closure khác bị từ chối trước khi chạy handler. Chưa có publish pipeline hay registry.
 - Ví dụ Procurement/Finance chạy được trên API thật (`examples/procurement_finance/`) cùng kiểm thử tích hợp và kiểm tra typing cho cả đường thành công lẫn lỗi tĩnh.
 - Ví dụ thực thi (`examples/atomic_approval/`) chạy đường consumer `query → row.as_ref() → invoke` nấc 2 trên adapter SQLite thật: commit đơn và giữ ngân sách trong một transaction, replay theo `request_key`, cùng các nhánh read/invoke denial và split binding. Kiểm thử tích hợp đọc lại dữ liệu bằng connection độc lập.
 - `bind_action()` kiểm tra deployment plan cho action `ATOMIC`: capability của provider, write set bắc cầu qua `calls`, một session enlist chung và mapping ủy quyền không rộng hơn contract; không gọi handler và không mở transaction.
@@ -50,6 +51,7 @@ src/codology/
   loading.py        # Load: thu thập definition, kiểm tra identity và field
   linking.py        # Link: resolve reference, export, kind và chữ ký handler
   snapshot.py       # Snapshot: graph đã link bất biến, lookup identity/version
+  manifest.py       # Manifest ghim: digest artifact, resolve revision chính xác
   binding.py        # Deployment binding: capability, write set, enlistment plan
   money.py          # MinorMoney: số nguyên đơn vị nhỏ, một currency
   ports.py          # Port lõi: guarded write, transaction, kết quả apply
@@ -89,6 +91,7 @@ tests/
   test_procurement_finance_integration.py
   test_atomic_approval_example.py # commit, denial, split binding, rollback, race, replay
   test_snapshot.py
+  test_manifest.py   # pin/resolve revision chính xác, digest byte đã nạp, fail closed
   test_invoke.py     # DENIED/REJECTED/StalePlan, ref scope, ctx hẹp, commit/rollback
   test_child_action.py # child đã link, ủy quyền, scope, rollback, một transaction
   typing/
@@ -244,7 +247,47 @@ assert DefinitionKey("finance.reserve_budget", "1.0.0") in published.entries
 
 Mỗi `SnapshotEntry` có `dependencies` (cạnh `calls`/`reads`/`writes`/`params`/`links`/`effects` kèm identity, version và owner của đích) và `approval` dạng cây biểu thức bất biến. `ComparisonExpr.operator` giữ nguyên toán tử nên consumer phân biệt được `>` và `>=`, kể cả trong `all_of`/`any_of`/`not_`. Key tra cứu lấy từ identity đã khai báo: đổi tên class host không làm đổi identity hay lookup.
 
-Snapshot **không** công bố handler digest: sprint này chưa định nghĩa bytes và phạm vi của digest, nên không có hash tùy ý nào được gọi là digest artifact publish. Snapshot không kéo theo engine, authorization hay execution.
+`Snapshot` không công bố digest của handler: nó là view của graph đã link và không nạp artifact nào. Digest artifact được định nghĩa ở lớp manifest ngay dưới, nơi bytes thực sự nạp và phạm vi pin được xác định; không có hash tùy ý nào trong snapshot được gọi là digest. Snapshot không kéo theo engine, authorization hay execution.
+
+## Manifest: ghim và phân giải đúng revision logic
+
+`pin_manifest(linked, action)` nhận graph đã link và một `DefinitionKey` của root Action, rồi trả `PinnedManifest` bất biến. Manifest liệt kê đúng closure đã khai báo, chia bốn nhóm:
+
+- `root`: Action gốc.
+- `children`: mọi Action/Function reachable qua `calls` bắc cầu.
+- `effects`: mọi `Effect` được khai báo bởi root hoặc child reachable.
+- `ontology`: mọi `ObjectType`/`Value` có identity mà các declaration trên tham chiếu qua `params`, `reads`, `writes`, `links`, `result` hoặc `payload`.
+
+Mỗi `ArtifactRevision` giữ `identity`, `version`, `kind` và `digest`. Digest là SHA-256 trên bytes của **source module thực sự định nghĩa declaration**, với line ending chuẩn hóa về LF. Hash cả module bao gồm thân handler và mọi helper cùng file, nên sửa logic tại chỗ làm đổi digest; handler bị gán từ module khác bị từ chối là artifact không hỗ trợ. Logic ở module khác được phủ gián tiếp vì mọi revision reachable đều được pin riêng. Import/helper từ module không nằm trong graph và `Value` anonymous nằm ngoài phạm vi pin đã hỗ trợ; `Value` anonymous chỉ được phủ bởi digest của module khai báo nó. Digest không phải intent fingerprint, identity hay version label.
+
+Source module lúc host import là artifact được pin; sửa code đã import trong cùng tiến trình nằm ngoài biên tin cậy in-process, giống các cửa khác của package. Một host khởi động lại sẽ nạp lại đúng file và digest được kiểm trên bytes đó.
+
+```python
+from codology import (
+    DefinitionKey,
+    decode_manifest,
+    encode_manifest,
+    link,
+    load,
+    pin_manifest,
+    resolve_manifest,
+)
+
+linked = link(load(*groups))
+manifest = pin_manifest(
+    linked, DefinitionKey("procurement.approve_purchase_order", "2.0.0")
+)
+payload = encode_manifest(manifest)          # JSON canonical, lưu được vào record
+restored = decode_manifest(payload)          # từ chối field lạ, digest sai, kind sai
+
+# Host có thể giữ nhiều revision set; manifest chọn đúng set đã ghim.
+resolved = resolve_manifest(restored, (linked_new, linked_old))
+assert resolved.root.definition.version == "2.0.0"
+```
+
+`resolve_manifest()` không có default/latest. Với một hoặc nhiều `LinkedDeclarations` của host, nó chỉ chấp nhận set mà: mọi revision đã pin có mặt đúng version; closure `calls`/`effects`/ontology từ root khớp chính xác manifest; kind và digest của artifact khớp. Thiếu artifact, byte đổi, kind đổi hoặc composition trỏ sang revision khác đều raise `MissingArtifact`, `DigestMismatch`, `KindMismatch` hay `ClosureMismatch` trước khi bất kỳ handler nào chạy. `manifest_digest()` định danh chính manifest bằng bytes canonical của nó.
+
+Đây là pin local trên graph đã link: không có registry, build artifact hay publish pipeline, và manifest không tự cấp quyền chạy logic. Declaration còn approval/effect chưa được engine hỗ trợ vẫn bị `invoke` từ chối như trước.
 
 ## Deployment binding: kiểm tra plan cho `ATOMIC`
 
@@ -498,13 +541,14 @@ Không cần backend: handler chỉ là metadata và không được gọi. Decl
 - **Invoke một handler:** quyền ghi được kiểm live ở cửa engine, ref chỉ có giá trị khi resolve lại dưới grant hiện tại; `ctx.require` tạo `REJECTED`, xung đột version/guard tạo `StalePlan`, lỗi cửa tạo `DENIED` mà không tạo execution. Commit là quyết định của engine sau revalidate, không phải của handler.
 - **Child action đã link:** `calls` và delegation grant được bind trước runtime; `ctx.call` chạy handler của đúng revision đã link với context thu hẹn theo `reads`/`writes` của child, dùng chung một UoW và một transaction. Child `REJECTED`/`DENIED` hủy toàn bộ execution; service identity và ref tự dựng không thay được requester.
 - **Sổ yêu cầu bền vững:** scope key là `tenant / requester / action identity` (ổn định qua rollout version); dấu vân tay intent do engine recompute từ dữ liệu đã canonicalize, không phải digest handler. Key, intent và kết quả `COMMITTED` được ghi trong cùng transaction với mọi business write; replay trả kết quả cũ, còn tra cứu cần quyền đọc execution record.
+- **Manifest ghim logic:** một execution ghim root Action, child Action/Function, effect và ontology revision có identity; digest là SHA-256 trên source module thực sự nạp (chuẩn hóa LF), không phải intent fingerprint hay version label. `resolve_manifest()` chỉ dùng revision đã ghim trong graph đã link, không có `latest`, và từ chối artifact thiếu/đổi/khác closure trước khi chạy handler.
 - **Consumer mẫu trên adapter thật:** `examples/atomic_approval/` giữ phần caller chỉ ở `query`, `row.as_ref()` và `invoke`; quyền, ngân sách và write nằm trong declaration/handler và engine. Split binding nấc 2 (hai file cùng SQLite) vẫn bị từ chối trước runtime, không hạ xuống saga.
 - Chi tiết và hệ quả cho các task sau: [`docs/official/design/implementation-baseline.md`](docs/official/design/implementation-baseline.md).
 
 ## Giới hạn
 
-- Đây vẫn là lớp mô hình tĩnh, deployment binding plan-check, adapter transaction có guarded write, cửa đọc có policy, cửa ghi `invoke()` với child đã link và sổ yêu cầu/kết quả bền vững. `examples/atomic_approval/` chỉ là consumer mẫu trên SQLite một file; chưa có publish artifact, approval/effect hay effect delivery.
-- Load đã thu thập definition và kiểm tra identity/field; Link đã resolve reference, kiểm tra export/kind và chữ ký handler; snapshot đã công bố graph bất biến với lookup tường minh; `bind_action()` đã kiểm tra capability, write set và enlistment plan trên snapshot. Adapter transaction thật đã có; chưa có registry bền vững hay publish artifact.
+- Đây vẫn là lớp mô hình tĩnh, manifest pin local trên graph đã link, deployment binding plan-check, adapter transaction có guarded write, cửa đọc có policy, cửa ghi `invoke()` với child đã link và sổ yêu cầu/kết quả bền vững. `examples/atomic_approval/` chỉ là consumer mẫu trên SQLite một file; chưa có publish artifact/registry, approval/effect runtime hay effect delivery.
+- Load đã thu thập definition và kiểm tra identity/field; Link đã resolve reference, kiểm tra export/kind và chữ ký handler; snapshot đã công bố graph bất biến với lookup tường minh; `pin_manifest()`/`resolve_manifest()` đã pin và phân giải đúng revision kèm digest artifact; `bind_action()` đã kiểm tra capability, write set và enlistment plan trên snapshot. Adapter transaction thật đã có; chưa có registry bền vững hay publish artifact.
 - Predicate approval chỉ được lưu dạng cấu trúc; chưa có đánh giá ngưỡng, callback duyệt hay giao effect. `Function` dùng cùng quy ước `handler(self, ctx, ...)` với `Action` theo implementation baseline.
 - Bằng chứng invoke chỉ phủ handler đơn, một child đã link và sổ yêu cầu/kết quả trên adapter SQLite đã bind: từ chối quyền/scope/type/ref cũ, `REJECTED`, guard stale, ghi ngoài declaration, child sai revision/quyền/scope, key trùng intent khác, race cùng key và hai đơn tranh một budget, split binding và replay sau mất phản hồi. Không có tuyên bố về publish artifact, approval/effect, PostgreSQL/ERP, mọi lịch trình interleaving hay sandbox handler trong-process.
 - Static validation không phát hiện truy cập ẩn trong thân handler (import lén, `getattr` động, đọc file/socket). Binding chỉ kiểm tra mapping khai báo; nó không phát hiện host code tự mở connection hoặc dùng credential ambient ngoài plan và không sandbox handler. Đó là rủi ro đã ghi nhận, xử lý bằng review và test.
