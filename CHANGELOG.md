@@ -27,6 +27,7 @@
 - Added end-to-end integration tests for the executable example: one commit with matching workflow state and ledger row, read and invoke denials that leave the database unchanged, split binding rejected before any write, rollback after a partial write, two orders contending for one budget with exactly one commit, and replay after a lost response.
 
 - Added an approval decision gate: `engine.approve()` and `engine.reject()` bind each callback to the current approval's key and material-intent fingerprint, check live approver role/permission, tenant, scope, `self_approval`, expiry and revocation supplied by the host, and record accepted decisions with a separate audit of every attempt. Replay under the same key rechecks authority, changed payloads are `KEY_MISUSE`, denied attempts do not claim the key, a valid reject ends once in `REJECTED` without business writes, and a valid approve is an input to resume rather than a commit.
+- Added an atomic resume gate: `resume()` re-resolves the pinned manifest, reruns the pinned root and child logic on current data, rechecks requester and approver authority and compares the material intent before one guarded commit. Expiry, revocation or a changed intent mints a new approval with a new callback key and fingerprint; stale guards and interrupted commits stay retryable, and the decision outcome is stored with its ledger transition.
 
 ### Fixed
 

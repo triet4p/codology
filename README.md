@@ -4,7 +4,7 @@ Codology (Ontology as Code) là framework khai báo thực thể, quan hệ và 
 
 ## Trạng thái
 
-Sprint 4 đã hoàn tất với lát cắt thực thi nguyên tử đồng bộ. [Sprint 5](docs/sprint-plans/sprint-5.md) đang triển khai từng phần: manifest ghim revision, trạng thái chờ ở cửa `invoke` và cửa quyết định duyệt đã có; resume và giao effect vẫn chưa được hỗ trợ. Các phần đã có:
+Sprint 4 đã hoàn tất với lát cắt thực thi nguyên tử đồng bộ. [Sprint 5](docs/sprint-plans/sprint-5.md) đang triển khai từng phần: manifest ghim revision, trạng thái chờ ở cửa `invoke`, cửa quyết định duyệt và resume đã có; giao effect vẫn chưa được hỗ trợ. Các phần đã có:
 
 - `codology` import được từ môi trường sạch, không cần database, credential hay backend SDK.
 - `codology.declarations` cung cấp primitive cấu trúc bất biến `Module`, `ObjectType`, `Value`, `Link` và `ObjectRef[T]`: identity/version tường minh, property có kiểu, link có target/cardinality/traversal và `exports` đóng băng.
@@ -13,6 +13,7 @@ Sprint 4 đã hoàn tất với lát cắt thực thi nguyên tử đồng bộ.
 - `pin_manifest()` / `resolve_manifest()` định nghĩa một manifest bền vững cho logic của execution: root Action, child Action/Function, effect và ontology revision đã khai báo, mỗi revision kèm digest SHA-256 của source module thực sự nạp. Host giữ nhiều revision set vẫn phân giải đúng revision đã ghim, không dùng default/latest; artifact thiếu, byte đổi, kind đổi hoặc closure khác bị từ chối trước khi chạy handler. Chưa có publish pipeline hay registry.
 - `engine.invoke()` đã ghi trạng thái chờ bền: declaration có `approval` chạy handler trong preview rồi bỏ preview, trả `AWAITING_APPROVAL` kèm execution ID, manifest đã pin, `material_intent` và `required_approval`; sổ yêu cầu giữ một key duy nhất, không giữ transaction hay write đơn/ngân sách/outbox. Dưới ngưỡng đi tiếp đường nguyên tử; declaration có `effects` vẫn bị từ chối tường minh.
 - `engine.approve()` / `engine.reject()` kiểm callback key gắn execution và approval hiện hành, fingerprint của material intent, role/permission live do host cung cấp, tenant/scope và `self_approval`; decision được ghi riêng và audit mọi attempt. `reject` hợp lệ chỉ chuyển execution sang `REJECTED` không ghi nghiệp vụ; approve hợp lệ là đầu vào cho resume, chưa phải commit.
+- `engine.resume()` mở UoW mới, phân giải đúng manifest đã ghim, chạy lại root và child ở revision đó trên dữ liệu hiện tại, kiểm lại quyền requester/approver, scope, hạn/thu hồi và so `material_intent` trước khi commit. Một transaction chứa guarded write, chuyển ledger và outcome của decision; hết hạn, thu hồi hoặc material đổi thì cấp approval/fingerprint mới, còn guard lệch thì `StalePlan` và rollback. `codology.resume_adapter.ResumeSQLiteProvider` là adapter thật cho đường này.
 - Ví dụ Procurement/Finance chạy được trên API thật (`examples/procurement_finance/`) cùng kiểm thử tích hợp và kiểm tra typing cho cả đường thành công lẫn lỗi tĩnh.
 - Ví dụ thực thi (`examples/atomic_approval/`) chạy đường consumer `query → row.as_ref() → invoke` nấc 2 trên adapter SQLite thật: commit đơn và giữ ngân sách trong một transaction, replay theo `request_key`, cùng các nhánh read/invoke denial và split binding. Kiểm thử tích hợp đọc lại dữ liệu bằng connection độc lập.
 - `bind_action()` kiểm tra deployment plan cho action `ATOMIC`: capability của provider, write set bắc cầu qua `calls`, một session enlist chung và mapping ủy quyền không rộng hơn contract; không gọi handler và không mở transaction.
@@ -57,6 +58,7 @@ src/codology/
   waiting.py        # Trạng thái chờ: canonical input, material intent, approval bền
   gate_support.py   # Kiểm tra plan/graph thuần dùng chung cho hai nhánh invoke
   decision.py       # Cửa quyết định: authority live, callback key, audit, terminal reject
+  resume.py        # Resume: recompute pinned, live checks, guarded finish, reapproval
   results.py        # Attempt/execution record, replay có quyền và reconcile
   binding.py        # Deployment binding: capability, write set, enlistment plan
   money.py          # MinorMoney: số nguyên đơn vị nhỏ, một currency
@@ -100,6 +102,9 @@ tests/
   test_manifest.py   # pin/resolve revision chính xác, digest byte đã nạp, fail closed
   test_waiting.py    # Ngưỡng chờ, replay, không lock/write, tenant và KEY_MISUSE
   test_invoke.py     # DENIED/REJECTED/StalePlan, ref scope, ctx hẹp, commit/rollback
+  resume_support.py  # graph, schema, provider và hook dùng chung cho resume
+  test_resume.py     # logic ghim, revalidation, reapproval, outcome terminal
+  test_resume_adapter.py # race, lost ack, commit bị ngắt, pin sai fail closed
   test_child_action.py # child đã link, ủy quyền, scope, rollback, một transaction
   typing/
     valid_api.py     # assert_type cho bề mặt công khai
@@ -294,7 +299,7 @@ assert resolved.root.definition.version == "2.0.0"
 
 `resolve_manifest()` không có default/latest. Với một hoặc nhiều `LinkedDeclarations` của host, nó chỉ chấp nhận set mà: mọi revision đã pin có mặt đúng version; closure `calls`/`effects`/ontology từ root khớp chính xác manifest; kind và digest của artifact khớp. Thiếu artifact, byte đổi, kind đổi hoặc composition trỏ sang revision khác đều raise `MissingArtifact`, `DigestMismatch`, `KindMismatch` hay `ClosureMismatch` trước khi bất kỳ handler nào chạy. `manifest_digest()` định danh chính manifest bằng bytes canonical của nó.
 
-Đây là pin local trên graph đã link: không có registry, build artifact hay publish pipeline, và manifest không tự cấp quyền chạy logic. Declaration có `effects` vẫn bị `invoke` từ chối tường minh; approval đã có nhánh chờ ở cửa invoke và cửa quyết định, resume chưa được hỗ trợ.
+Đây là pin local trên graph đã link: không có registry, build artifact hay publish pipeline, và manifest không tự cấp quyền chạy logic. Declaration có `effects` vẫn bị `invoke` và `resume` từ chối tường minh; approval đã có nhánh chờ ở cửa invoke, cửa quyết định và cửa resume.
 
 ## Invoke chờ duyệt: ghi trạng thái bền, không giữ transaction
 
@@ -308,7 +313,7 @@ if result.attempt.code == "AWAITING_APPROVAL":
     # result.execution.material_intent.fingerprint là nội dung đã trình duyệt
 ```
 
-Cùng `request_key` và intent → replay trả đúng execution đã lưu, kể cả khi host đổi revision mặc định; intent khác với key cũ bị `KEY_MISUSE`. Đọc lại cần quyền `execution.read`; tenant/principal khác không thấy record. `approval_expires_at` do host cung cấp và có hạn mặc định; ngưỡng, role và `self_approval` vẫn thuộc declaration. Resume và outbox chưa nằm ở bước này.
+Cùng `request_key` và intent → replay trả đúng execution đã lưu, kể cả khi host đổi revision mặc định; intent khác với key cũ bị `KEY_MISUSE`. Đọc lại cần quyền `execution.read`; tenant/principal khác không thấy record. `approval_expires_at` do host cung cấp và có hạn mặc định; ngưỡng, role và `self_approval` vẫn thuộc declaration. Resume nằm ở phần tiếp theo; outbox/effect vẫn chưa nằm ở bước này.
 
 ## Cửa quyết định duyệt: đúng người, đúng intent, đúng một lần
 
@@ -328,6 +333,28 @@ result = engine.approve(
 
 Decision được ghi dưới khóa callback riêng trong cùng transaction với audit của attempt. Outsider, sai tenant/scope, mất role hoặc permission, tự duyệt bị cấm, approval hết hạn/bị thu hồi hay bị thay đều trả `DENIED` **cho callback đó**: execution vẫn `AWAITING_APPROVAL`, không có decision nào chiếm khóa, và audit ghi attempt bị từ chối tách khỏi lịch sử execution. Cùng khóa với decision/fingerprint/reason đã lưu là replay có kiểm lại authority; đổi payload với khóa cũ là `KEY_MISUSE`. `approve` hợp lệ trả attempt `AWAITING_APPROVAL` kèm `DecisionResult.decision` làm đầu vào cho resume; nó không ghi đơn, ngân sách hay outbox. `reject` hợp lệ trả `REJECTED`, chuyển đúng một lần sang terminal `REJECTED` và không ghi nghiệp vụ; replay sau đó không thêm transition. Provider SQLite dùng hai bảng `approval_decisions` và `approval_audit` cạnh `request_ledger`; xóa hoặc sửa payload decision làm callback fail closed.
 
+## Resume: tính lại trên logic ghim, hoàn tất nguyên tử
+
+`resume()` nhận `execution_id`, `callback_key` của decision `APPROVE` đã lưu, principal requester đang có quyền, read grant do host phát, bound plan của revision đã ghim và các revision set host đang nạp. Engine phân giải manifest đã pin, chạy lại handler root/child trên dữ liệu hiện tại, kiểm lại authority, scope, hạn/thu hồi và so `material_intent` trước khi viết. Chỉ khi mọi thứ khớp, một transaction áp dụng guarded write, chuyển ledger sang `COMMITTED` và lưu outcome của decision; guard lệch trả `StalePlan` với rollback sạch, mất ack trả `UNKNOWN` rồi đối soát bằng `reconcile()` hoặc `reconcile_execution()`.
+
+```python
+from codology.resume import reconcile_execution, resume
+from codology.resume_adapter import ResumeSQLiteProvider
+
+provider = ResumeSQLiteProvider(sqlite_provider)
+result = resume(
+    provider=provider,
+    revisions=(graph_default, graph_pinned),
+    bound=bound_pinned,
+    principal=alice_with_live_permissions,
+    grants=grants,
+    execution_id=waiting.execution.execution_id,
+    callback_key=approved.decision.callback_key,
+    authority_provider=host_authority,
+)
+```
+
+Approval hết hạn/bị thu hồi hoặc material đổi thì resume trả `AWAITING_APPROVAL` với approval ID, callback key và fingerprint mới; khóa cũ không commit được nữa. Decision outcome được lưu cùng transition tương ứng trong một transaction, nên replay hay commit bị ngắt không tạo lần ghi thứ hai. Outbox và effect vẫn chưa được hỗ trợ ở bước này.
 
 ## Deployment binding: kiểm tra plan cho `ATOMIC`
 
