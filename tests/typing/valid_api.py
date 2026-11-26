@@ -30,11 +30,14 @@ from codology import (
     Snapshot,
     SnapshotEntry,
     VersionedRef,
+    authorize_read,
+    is_issued_ref,
     link,
     load,
     snapshot,
 )
 from codology.declarations import ObjectRef
+from codology.engine import ActionResult, AttemptOutcome
 from examples.procurement_finance.finance import Budget
 from examples.procurement_finance.model import FINANCE_GROUP, PROCUREMENT_GROUP
 
@@ -85,3 +88,20 @@ assert_type(
     VersionedRef[object],
 )
 assert_type(QueryPage((row,), 1, None), QueryPage[Budget])
+assert_type(
+    authorize_read(
+        Principal("alice", "A", frozenset({"read"})),
+        ReadGrant(
+            "alice",
+            DefinitionKey("finance.budget", "1.0.0"),
+            "A",
+            ("team1",),
+            "read",
+        ),
+        DefinitionKey("finance.budget", "1.0.0"),
+    ),
+    None,
+)
+assert_type(is_issued_ref(None), bool)
+assert_type(AttemptOutcome("COMMITTED", None), AttemptOutcome)
+assert_type(ActionResult(AttemptOutcome("DENIED", None)), ActionResult)

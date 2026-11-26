@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import subprocess
 import sys
+from pathlib import Path
 
 import codology
 import codology.declarations
@@ -11,9 +13,19 @@ def test_package_imports_and_reports_a_version() -> None:
 
 
 def test_declarations_import_does_not_pull_runtime_layers() -> None:
-    assert "codology.registry" not in sys.modules
-    assert "codology.engine" not in sys.modules
-    assert "codology.adapters" not in sys.modules
+    code = (
+        "import sys; import codology.declarations; "
+        "assert 'codology.registry' not in sys.modules; "
+        "assert 'codology.engine' not in sys.modules; "
+        "assert 'codology.adapters' not in sys.modules"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_declarations_expose_the_handler_convention_name() -> None:

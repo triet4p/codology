@@ -27,7 +27,10 @@ from codology.query import (
     QueryPredicate,
     QueryRequest,
     QueryRow,
+    ReadGrant,
     UnsupportedSecureQuery,
+    VersionedRef,
+    is_issued_ref,
     issue_cursor,
 )
 
@@ -389,6 +392,46 @@ class SQLiteProvider:
                 rows[-1].key,
             )
         return QueryPage(rows=rows, count=count, next_cursor=next_cursor)
+
+    def resolve(self, ref: VersionedRef[object], grant: ReadGrant) -> QueryRow[object] | None:
+        """Resolve one issued ref under the grant's live tenant and scope policy."""
+        if not is_issued_ref(ref) or ref.definition != grant.definition:
+            return None
+        binding = self.resources.get(ref.definition.identity)
+        if (
+            binding is None
+            or binding.version != ref.definition.version
+            or binding.tenant_column is None
+            or binding.scope_column is None
+        ):
+            raise UnsupportedSecureQuery(
+                "no scoped read mapping for "
+                f"{ref.definition.identity!r}@{ref.definition.version!r}."
+            )
+        key_column = _identifier(binding.key_column, "key column")
+        version_column = _identifier(binding.version_column, "version column")
+        tenant_column = _identifier(binding.tenant_column, "tenant column")
+        scope_column = _identifier(binding.scope_column, "scope column")
+        table = _identifier(binding.table, "table")
+        selected = tuple(dict.fromkeys([key_column, version_column, *binding.columns]))
+        placeholders = ", ".join("?" for _ in grant.scopes)
+        statement = (
+            f"SELECT {', '.join(selected)} FROM {table} "
+            f"WHERE {tenant_column} = ? AND {scope_column} IN ({placeholders}) "
+            f"AND {key_column} = ?"
+        )
+        parameters = (grant.tenant, *grant.scopes, ref.key)
+        with closing(sqlite3.connect(self.database, timeout=10.0, isolation_level=None)) as conn:
+            conn.execute("PRAGMA query_only = ON")
+            found = conn.execute(statement, parameters).fetchone()
+        if found is None:
+            return None
+        return QueryRow.issue(
+            ref.definition,
+            str(found[selected.index(key_column)]),
+            int(found[selected.index(version_column)]),
+            {name: found[index] for index, name in enumerate(selected)},
+        )
 
 
 __all__ = [

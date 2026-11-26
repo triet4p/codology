@@ -85,6 +85,8 @@ from codology.query import (
     SecureQueryProvider,
     UnsupportedSecureQuery,
     VersionedRef,
+    authorize_read,
+    is_issued_ref,
     query,
 )
 from codology.snapshot import (
@@ -121,6 +123,8 @@ __all__ = [
     "BoundDelegation",
     "BoundWrite",
     "Capability",
+    "authorize_read",
+    "is_issued_ref",
     "ComparisonExpr",
     "Condition",
     "DefinitionKey",

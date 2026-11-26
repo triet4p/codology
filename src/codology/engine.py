@@ -1,0 +1,562 @@
+"""Engine invoke gate: live authorization, scoped resolution, one scoped UoW.
+
+A consumer never supplies a connection, a handler result, or its own mutation
+plan. The engine takes a linked graph and the deployment plan bound from that
+same graph, checks invoke authority and the current read scope, resolves every
+typed ref through the read port, runs one declared handler with a narrow context,
+revalidates the world, then commits one guarded transaction or changes nothing.
+"""
+
+from __future__ import annotations
+
+import uuid
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Literal, Protocol, cast
+
+from codology.binding import BoundAction, BoundCall, BoundDelegation, SessionPlan
+from codology.declarations import Action, ObjectRef
+from codology.linking import LinkedDeclarations, LinkedDefinition
+from codology.money import MinorMoney
+from codology.ports import (
+    ApplyResult,
+    Assignment,
+    Condition,
+    GuardedWrite,
+    StalePlan,
+    UnitOfWork,
+)
+from codology.query import (
+    Principal,
+    QueryRow,
+    ReadGrant,
+    VersionedRef,
+    authorize_read,
+    is_issued_ref,
+)
+from codology.snapshot import DefinitionKey
+from codology.uow import UnboundWriteAttempt, commit_guarded_writes
+
+InvokeCode = Literal["COMMITTED", "DENIED", "REJECTED", "StalePlan"]
+ExecutionStatus = Literal["COMMITTED", "REJECTED"]
+
+_DENIED_DETAIL = "invoke request was refused by the engine gate."
+_STALE_DETAIL = "the resolved world changed; re-read and recompute before retrying."
+_SEAL = object()
+
+
+class InvokeDenied(ValueError):
+    """A request, ref, or context capability failed a closed engine gate."""
+
+
+class BusinessRejected(ValueError):
+    """A handler's ``ctx.require`` failed; this is a business outcome."""
+
+
+class WriteNotDeclared(InvokeDenied):
+    """A mutation targets an object the action did not declare as writable."""
+
+
+class _Stale(Exception):
+    """A resolved version no longer matches the current world."""
+
+
+class ResourceSpec(Protocol):
+    """The mapped columns an engine needs to check a registration."""
+
+    @property
+    def columns(self) -> tuple[str, ...]: ...
+
+
+class ScopedEngineProvider(Protocol):
+    """Read-port resolution plus the bound transaction port, owned by an adapter."""
+
+    @property
+    def resources(self) -> Mapping[str, ResourceSpec]: ...
+
+    def resolve(self, ref: VersionedRef[object], grant: ReadGrant) -> QueryRow[object] | None: ...
+
+    def begin(self, plan: SessionPlan) -> UnitOfWork: ...
+
+
+type ChildExecutor = Callable[[HandlerCtx, Mapping[str, object]], object]
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptOutcome:
+    """What the caller may know about one invoke attempt."""
+
+    code: InvokeCode
+    detail: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedChange:
+    """One accepted mutation plan, without exposing handler internals."""
+
+    resource: str
+    key: str
+    version: int
+    changes: tuple[Assignment, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionRecord:
+    """The non-authoritative in-process outcome of one accepted execution."""
+
+    execution_id: str
+    status: ExecutionStatus
+    action: DefinitionKey
+    requester: Principal
+    committed: tuple[CommittedChange, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ActionResult:
+    """An attempt outcome plus an execution only when one was actually created."""
+
+    attempt: AttemptOutcome
+    execution: ExecutionRecord | None = None
+    writes: tuple[ApplyResult, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedObject[T]:
+    """A row handle issued by scoped resolution; it carries no authority itself."""
+
+    definition: DefinitionKey
+    key: str
+    version: int
+    values: Mapping[str, object]
+    _seal: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._seal is not _SEAL:
+            raise ValueError("resolved objects are issued by the engine only.")
+        object.__setattr__(self, "values", MappingProxyType(dict(self.values)))
+
+    @property
+    def ref(self) -> VersionedRef[T]:
+        return cast(VersionedRef[T], VersionedRef.issue(self.definition, self.key, self.version))
+
+    @property
+    def instance_version(self) -> int:
+        """The row version carried by the ref this handle came from."""
+        return self.version
+
+    def __getattr__(self, name: str) -> object:
+        values = object.__getattribute__(self, "values")
+        if name in values:
+            return values[name]
+        raise AttributeError(f"{type(self).__name__} has no field {name!r}.")
+
+
+@dataclass(frozen=True, slots=True)
+class _Registration:
+    target: ResolvedObject[object]
+    changes: tuple[Assignment, ...]
+    guards: tuple[Condition, ...]
+
+
+class ScopedUoW:
+    """Mutation registration only; commit and rollback stay with the engine."""
+
+    __slots__ = ("_allowed", "_columns", "_registrations")
+
+    def __init__(
+        self,
+        allowed: frozenset[str],
+        columns: Mapping[str, tuple[str, ...]],
+    ) -> None:
+        self._allowed = allowed
+        self._columns = columns
+        self._registrations: list[_Registration] = []
+
+    def register_mutation(self, obj: object, **fields: object) -> None:
+        """Register one guarded intent on a resolved object the action may write."""
+        if not isinstance(obj, ResolvedObject):
+            raise InvokeDenied("mutations need an object resolved by this execution.")
+        expected = fields.pop("expectedVersion", None)
+        if type(expected) is not int:
+            raise InvokeDenied("expectedVersion must be the integer version of the object.")
+        if expected != obj.version:
+            raise _Stale()
+        if obj.definition.identity not in self._allowed or not fields:
+            raise WriteNotDeclared("the mutation is outside the declared write set.")
+        mapped = self._columns.get(obj.definition.identity, ())
+        if any(name not in mapped for name in fields):
+            raise InvokeDenied("the mutation names a column the adapter did not map.")
+
+        guards = tuple(
+            Condition(column, "==", value)
+            for column in mapped
+            if (value := obj.values.get(column)) is not None
+            and isinstance(value, str | int | MinorMoney)
+            and not isinstance(value, bool)
+        )
+        changes = tuple(Assignment(name, "set", value) for name, value in fields.items())
+        self._registrations.append(
+            _Registration(cast(ResolvedObject[object], obj), changes, guards)
+        )
+
+    @property
+    def registrations(self) -> tuple[_Registration, ...]:
+        return tuple(self._registrations)
+
+
+class HandlerCtx:
+    """The only surface a handler sees: principal, reads, writes, calls, require."""
+
+    __slots__ = (
+        "_calls",
+        "_columns",
+        "_delegations",
+        "_executors",
+        "_grants",
+        "_principal",
+        "_provider",
+        "_reads",
+        "_uow",
+        "_writes",
+    )
+
+    def __init__(
+        self,
+        *,
+        principal: Principal,
+        reads: frozenset[DefinitionKey],
+        writes: frozenset[str],
+        calls: tuple[BoundCall, ...],
+        delegations: tuple[BoundDelegation, ...],
+        grants: Mapping[DefinitionKey, ReadGrant],
+        provider: ScopedEngineProvider,
+        executors: Mapping[DefinitionKey, ChildExecutor],
+        columns: Mapping[str, tuple[str, ...]],
+    ) -> None:
+        self._principal = principal
+        self._reads = reads
+        self._writes = writes
+        self._calls = calls
+        self._delegations = delegations
+        self._grants = grants
+        self._provider = provider
+        self._executors = executors
+        self._columns = columns
+        self._uow = ScopedUoW(writes, columns)
+
+    @property
+    def principal(self) -> Principal:
+        """The authenticated requester; never an approver or service identity."""
+        return self._principal
+
+    @property
+    def reads(self) -> tuple[DefinitionKey, ...]:
+        return tuple(sorted(self._reads))
+
+    @property
+    def writes(self) -> tuple[str, ...]:
+        return tuple(sorted(self._writes))
+
+    @property
+    def calls(self) -> tuple[str, ...]:
+        return tuple(sorted({bound.callee.identity for bound in self._calls}))
+
+    @property
+    def uow(self) -> ScopedUoW:
+        return self._uow
+
+    def require(self, condition: bool, *, reason: str) -> None:
+        """Turn a false business condition into `REJECTED`, never `DENIED`."""
+        if type(condition) is not bool or type(reason) is not str or not reason.strip():
+            raise InvokeDenied("require needs a boolean condition and a reason.")
+        if not condition:
+            raise BusinessRejected(reason)
+
+    def resolve(self, ref: object) -> ResolvedObject[object]:
+        """Resolve an issued ref only inside the action's declared read set."""
+        if not is_issued_ref(ref):
+            raise InvokeDenied("only refs issued by an authorized query can be resolved.")
+        typed = cast(VersionedRef[object], ref)
+        if typed.definition not in self._reads:
+            raise InvokeDenied("the ref type is outside the declared read set.")
+        return _resolve_scoped(self._provider, self._principal, self._grants, typed)
+
+    def call(self, action: object, **params: object) -> object:
+        """Dispatch only a declared call under a checked requester delegation."""
+        if not isinstance(action, str):
+            raise InvokeDenied("a call names an action identity.")
+        target = next(
+            (bound for bound in self._calls if bound.callee.identity == action),
+            None,
+        )
+        if target is None:
+            raise InvokeDenied("the call is not declared by this action.")
+        delegation = next(
+            (item for item in self._delegations if item.callee == target.callee),
+            None,
+        )
+        if delegation is None or delegation.permission not in self._principal.permissions:
+            raise InvokeDenied("the requester has no live delegated permission for this call.")
+        executor = self._executors.get(target.callee)
+        if executor is None:
+            raise InvokeDenied("no executor is configured for this declared call.")
+        return executor(self, params)
+
+
+def invoke(
+    *,
+    linked: LinkedDeclarations,
+    action: DefinitionKey,
+    bound: BoundAction,
+    provider: ScopedEngineProvider,
+    principal: Principal,
+    grants: Mapping[DefinitionKey, ReadGrant],
+    parameters: Mapping[str, object],
+    child_executors: Mapping[DefinitionKey, ChildExecutor] = MappingProxyType({}),
+) -> ActionResult:
+    """Run one declared handler behind the invoke gate and commit at most once."""
+    try:
+        entry = _entry(linked, action, bound)
+        declaration = cast(type[Action], entry.definition.declaration)
+        if declaration.permission not in principal.permissions:
+            raise InvokeDenied("the requester lacks the action's invoke permission.")
+        if declaration.approval is not None or declaration.effects:
+            raise InvokeDenied(
+                "this declaration needs governance a synchronous invoke cannot honor."
+            )
+        arguments = _arguments(entry, action, parameters, provider, principal, grants)
+        columns = {identity: tuple(spec.columns) for identity, spec in provider.resources.items()}
+        declared_writes = {getattr(raw, "identity", raw) for raw in declaration.writes}
+        allowed_writes = frozenset(
+            identity
+            for identity in (item.definition.identity for item in linked.all_definitions)
+            if identity is not None and identity in declared_writes
+        )
+        _require_plan_writes(bound, allowed_writes)
+        ctx = HandlerCtx(
+            principal=principal,
+            reads=_defined_keys(linked, declaration.reads),
+            writes=allowed_writes,
+            calls=bound.calls,
+            delegations=bound.delegations,
+            grants=grants,
+            provider=provider,
+            executors=child_executors,
+            columns=columns,
+        )
+        handler = cast(Callable[..., object], vars(declaration)["handler"])
+        handler(declaration(), ctx, **arguments)
+
+        registrations = ctx.uow.registrations
+        if not registrations:
+            raise InvokeDenied("a write-declaring action registered no mutation.")
+        writes = _guarded(registrations, bound, provider, principal, grants)
+        results = commit_guarded_writes(provider, _session(bound), writes)
+    except BusinessRejected as exc:
+        return _rejected(action, principal, str(exc))
+    except (InvokeDenied, UnboundWriteAttempt, ValueError, PermissionError) as exc:
+        detail = str(exc) if isinstance(exc, InvokeDenied) else _DENIED_DETAIL
+        return _outcome("DENIED", detail)
+    except (_Stale, StalePlan):
+        return _outcome("StalePlan", _STALE_DETAIL)
+
+    committed = tuple(
+        CommittedChange(
+            registration.target.definition.identity,
+            registration.target.key,
+            registration.target.version,
+            registration.changes,
+        )
+        for registration in registrations
+    )
+    return ActionResult(
+        attempt=AttemptOutcome("COMMITTED", None),
+        execution=ExecutionRecord(
+            execution_id=uuid.uuid4().hex,
+            status="COMMITTED",
+            action=action,
+            requester=principal,
+            committed=committed,
+        ),
+        writes=tuple(results),
+    )
+
+
+def _entry(
+    linked: LinkedDeclarations,
+    action: DefinitionKey,
+    bound: BoundAction,
+) -> LinkedDefinition:
+    if bound.action != action or bound.session is None:
+        raise InvokeDenied("the bound plan does not name this exact action and session.")
+    entry = linked.definitions.get(action.identity)
+    if (
+        entry is None
+        or entry.definition.version != action.version
+        or not issubclass(entry.definition.declaration, Action)
+    ):
+        raise InvokeDenied("no linked action exists at this exact identity and version.")
+    return entry
+
+
+def _arguments(
+    entry: LinkedDefinition,
+    action: DefinitionKey,
+    parameters: Mapping[str, object],
+    provider: ScopedEngineProvider,
+    principal: Principal,
+    grants: Mapping[DefinitionKey, ReadGrant],
+) -> dict[str, object]:
+    declaration = cast(type[Action], entry.definition.declaration)
+    if set(parameters) != set(declaration.properties):
+        raise InvokeDenied("parameters must match the declared parameter names exactly.")
+    arguments: dict[str, object] = {}
+    for name in declaration.properties:
+        hint = entry.hints[name]
+        value = parameters[name]
+        if isinstance(hint, type) and issubclass(hint, ObjectRef):
+            expected = _ref_target(hint)
+            if not is_issued_ref(value):
+                raise InvokeDenied(
+                    "a typed ref parameter needs a ref issued by an authorized query."
+                )
+            typed = cast(VersionedRef[object], value)
+            if typed.definition != expected:
+                raise InvokeDenied("the ref does not match the declared parameter type.")
+            arguments[name] = _resolve_scoped(provider, principal, grants, typed)
+            continue
+        if isinstance(hint, type) and not isinstance(value, hint):
+            raise InvokeDenied("a parameter has the wrong declared type.")
+        if hint is int and isinstance(value, bool):
+            raise InvokeDenied("a boolean is not an integer parameter.")
+        arguments[name] = value
+    return arguments
+
+
+def _ref_target(hint: type[object]) -> DefinitionKey:
+    target = cast(object, getattr(hint, "target", None))
+    identity = getattr(target, "identity", None)
+    version = getattr(target, "version", None)
+    if not isinstance(identity, str) or not identity or not isinstance(version, str) or not version:
+        raise InvokeDenied("the declared ref target is not version-explicit.")
+    return DefinitionKey(identity, version)
+
+
+def _resolve_scoped(
+    provider: ScopedEngineProvider,
+    principal: Principal,
+    grants: Mapping[DefinitionKey, ReadGrant],
+    ref: VersionedRef[object],
+) -> ResolvedObject[object]:
+    grant = grants.get(ref.definition)
+    if grant is None:
+        raise InvokeDenied("no current read grant covers this ref's definition.")
+    authorize_read(principal, grant, ref.definition)
+    row = provider.resolve(ref, grant)
+    if row is None:
+        raise InvokeDenied("the ref is outside the current tenant or scope.")
+    if row.instance_version != ref.instance_version:
+        raise _Stale()
+    return _resolved(row)
+
+
+def _resolved(row: QueryRow[object]) -> ResolvedObject[object]:
+    return ResolvedObject(
+        row.definition,
+        row.key,
+        row.instance_version,
+        row.values,
+        _SEAL,
+    )
+
+
+def _defined_keys(linked: LinkedDeclarations, raw: Sequence[object]) -> frozenset[DefinitionKey]:
+    keys: set[DefinitionKey] = set()
+    for value in raw:
+        identity = cast(object, getattr(value, "identity", value))
+        if not isinstance(identity, str) or not identity:
+            raise InvokeDenied("a declared read has no identity.")
+        item = linked.definitions.get(identity)
+        if item is None or item.definition.version is None:
+            raise InvokeDenied("a declared read is not in the linked graph.")
+        keys.add(DefinitionKey(identity, item.definition.version))
+    return frozenset(keys)
+
+
+def _require_plan_writes(bound: BoundAction, allowed: frozenset[str]) -> None:
+    session = _session(bound)
+    writable = {item.identity for item in session.writes}
+    for bound_write in bound.writes:
+        if bound_write.resource.identity not in writable:
+            raise InvokeDenied("the bound session does not contain a declared write.")
+    for identity in allowed:
+        if identity not in writable:
+            raise InvokeDenied("a declared write has no enlistment in the bound session.")
+
+
+def _session(bound: BoundAction) -> SessionPlan:
+    if bound.session is None:
+        raise InvokeDenied("no session plan is bound to this action.")
+    return bound.session
+
+
+def _guarded(
+    registrations: tuple[_Registration, ...],
+    bound: BoundAction,
+    provider: ScopedEngineProvider,
+    principal: Principal,
+    grants: Mapping[DefinitionKey, ReadGrant],
+) -> tuple[GuardedWrite, ...]:
+    session = _session(bound)
+    for registration in registrations:
+        target = registration.target
+        ref = target.ref
+        row = _resolve_scoped(provider, principal, grants, ref)
+        if row.version != target.version:
+            raise _Stale()
+        if target.definition.identity not in {item.identity for item in session.writes}:
+            raise WriteNotDeclared("the write is not enlisted in the bound session.")
+    return tuple(
+        GuardedWrite(
+            item.target.definition.identity,
+            item.target.key,
+            item.target.version,
+            item.changes,
+            item.guards,
+        )
+        for item in registrations
+    )
+
+
+def _rejected(action: DefinitionKey, principal: Principal, detail: str) -> ActionResult:
+    return ActionResult(
+        attempt=AttemptOutcome("REJECTED", detail),
+        execution=ExecutionRecord(
+            execution_id=uuid.uuid4().hex,
+            status="REJECTED",
+            action=action,
+            requester=principal,
+        ),
+    )
+
+
+def _outcome(code: InvokeCode, detail: str | None) -> ActionResult:
+    return ActionResult(attempt=AttemptOutcome(code, detail))
+
+
+__all__ = [
+    "ActionResult",
+    "AttemptOutcome",
+    "BusinessRejected",
+    "ChildExecutor",
+    "CommittedChange",
+    "ExecutionRecord",
+    "HandlerCtx",
+    "InvokeDenied",
+    "ResolvedObject",
+    "ScopedEngineProvider",
+    "ScopedUoW",
+    "WriteNotDeclared",
+    "invoke",
+]

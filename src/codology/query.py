@@ -329,6 +329,18 @@ def _authorize(principal: Principal, grant: ReadGrant, from_: DefinitionKey) -> 
         )
 
 
+def authorize_read(principal: Principal, grant: ReadGrant, definition: DefinitionKey) -> None:
+    """Check the principal's live read authority before any scoped row access."""
+    _authorize(principal, grant, definition)
+
+
+def is_issued_ref(ref: object) -> bool:
+    """Whether a ref came from an authorized row rather than caller construction."""
+    if type(ref) is not VersionedRef:
+        return False
+    return cast(object, getattr(cast(object, ref), "_seal", None)) is _ISSUE_TOKEN
+
+
 def _is_scalar(value: object) -> bool:
     return value is None or (
         isinstance(value, str | int | MinorMoney) and not isinstance(value, bool)
@@ -415,8 +427,8 @@ __all__ = [
     "ReadDenied",
     "ReadGrant",
     "SecureQueryProvider",
-    "UnsupportedSecureQuery",
+    "authorize_read",
     "VersionedRef",
-    "issue_cursor",
+    "is_issued_ref",
     "query",
 ]
