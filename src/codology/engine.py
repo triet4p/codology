@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Protocol, cast
 
-from codology.binding import BoundAction, BoundCall, BoundDelegation, SessionPlan
+from codology.binding import BoundAction, BoundCall, BoundDelegation, BoundEffect, SessionPlan
 from codology.decision import (
     ApprovalAuthority,
     ApprovalAuthorityProvider,
@@ -50,6 +50,15 @@ from codology.ledger import (
 from codology.ledger import intent_fingerprint as compute_intent_fingerprint
 from codology.linking import LinkedDeclarations, LinkedDefinition
 from codology.money import MinorMoney
+from codology.outbox import (
+    DeclaredEffect,
+    EffectIntent,
+    OutboxError,
+    declared_effects,
+    enqueue,
+    envelope,
+    require_outbox_binding,
+)
 from codology.ports import (
     Assignment,
     CommitOutcomeUnknown,
@@ -183,22 +192,33 @@ class _Execution:
     columns: Mapping[str, tuple[str, ...]]
     registrations: list[_Registration]
     children: list[DefinitionKey]
+    effects: tuple[DeclaredEffect, ...] = ()
+    bound_effects: tuple[BoundEffect, ...] = ()
+    execution_id: str = ""
+    pending_effects: list[EffectIntent] = field(default_factory=list)
 
 
 class ScopedUoW:
-    """Mutation registration only; commit and rollback stay with the engine."""
+    """Mutation and effect registration only; commit and rollback stay with the engine."""
 
-    __slots__ = ("_allowed", "_columns", "_registrations")
+    __slots__ = ("_allowed", "_columns", "_effects", "_execution_id", "_pending", "_registrations")
 
     def __init__(
         self,
         allowed: frozenset[str],
         columns: Mapping[str, tuple[str, ...]],
         registrations: list[_Registration] | None = None,
+        *,
+        effects: tuple[DeclaredEffect, ...] = (),
+        execution_id: str = "",
+        pending: list[EffectIntent] | None = None,
     ) -> None:
         self._allowed = allowed
         self._columns = columns
         self._registrations = [] if registrations is None else registrations
+        self._effects = effects
+        self._execution_id = execution_id
+        self._pending = [] if pending is None else pending
 
     def register_mutation(self, obj: object, **fields: object) -> None:
         """Register one guarded intent on a resolved object the action may write."""
@@ -231,6 +251,12 @@ class ScopedUoW:
     def registrations(self) -> tuple[_Registration, ...]:
         return tuple(self._registrations)
 
+    def enqueue_effect(self, effect: object, *, payload: object) -> None:
+        """Register one declared effect as a typed snapshot, never as a send."""
+        intent = enqueue(self._effects, effect, payload, self._execution_id)
+
+        self._pending.append(intent)
+
 
 class HandlerCtx:
     """The only surface a handler sees: principal, reads, writes, calls, require."""
@@ -238,6 +264,7 @@ class HandlerCtx:
     __slots__ = (
         "_calls",
         "_delegations",
+        "_effects",
         "_execution",
         "_principal",
         "_reads",
@@ -254,6 +281,7 @@ class HandlerCtx:
         calls: tuple[BoundCall, ...],
         delegations: tuple[BoundDelegation, ...],
         execution: _Execution,
+        effects: tuple[DeclaredEffect, ...] = (),
     ) -> None:
         self._principal = principal
         self._reads = reads
@@ -261,7 +289,15 @@ class HandlerCtx:
         self._calls = calls
         self._delegations = delegations
         self._execution = execution
-        self._uow = ScopedUoW(writes, execution.columns, execution.registrations)
+        self._effects = effects
+        self._uow = ScopedUoW(
+            writes,
+            execution.columns,
+            execution.registrations,
+            effects=effects,
+            execution_id=execution.execution_id,
+            pending=execution.pending_effects,
+        )
 
     @property
     def principal(self) -> Principal:
@@ -351,6 +387,15 @@ class HandlerCtx:
         return handler(declaration(), child, **arguments)
 
 
+def _effects_for(
+    declaration: type[Action], linked: LinkedDeclarations, bound: BoundAction
+) -> tuple[DeclaredEffect, ...]:
+    """Resolve declared effects and their outbox session before any handler runs."""
+    specs = declared_effects(declaration, linked)
+    require_outbox_binding(bound, specs)
+    return specs
+
+
 def invoke(
     *,
     linked: LinkedDeclarations,
@@ -369,16 +414,15 @@ def invoke(
     unit: UnitOfWork | None = None
     scope: RequestScope | None = None
     fingerprint: str | None = None
+    execution_id = uuid.uuid4().hex
     try:
         entry = linked_action(linked, action, bound)
         declaration = cast(type[Action], entry.definition.declaration)
         if declaration.permission not in principal.permissions:
             raise InvokeDenied("the requester lacks the action's invoke permission.")
         approval = declaration.approval
-        if declaration.effects:
-            raise InvokeDenied(
-                "this declaration needs effect governance a synchronous invoke cannot honor."
-            )
+        effects = _effects_for(declaration, linked, bound)
+
         if request_key is not None:
             scope = request_scope(principal, action)
             fingerprint = compute_intent_fingerprint(action, parameters)
@@ -407,7 +451,18 @@ def invoke(
         columns = {identity: tuple(spec.columns) for identity, spec in provider.resources.items()}
         allowed_writes = declared_writes(linked, declaration.writes)
         require_writes(bound, allowed_writes)
-        execution = _Execution(linked, bound, provider, grants, columns, [], [])
+        execution = _Execution(
+            linked,
+            bound,
+            provider,
+            grants,
+            columns,
+            [],
+            [],
+            effects=effects,
+            bound_effects=bound.effects,
+            execution_id=execution_id,
+        )
         ctx = HandlerCtx(
             principal=principal,
             reads=defined_keys(linked, declaration.reads),
@@ -415,6 +470,7 @@ def invoke(
             calls=bound.calls,
             delegations=bound.delegations,
             execution=execution,
+            effects=effects,
         )
         handler = cast(Callable[..., object], vars(declaration)["handler"])
         handler(declaration(), ctx, **arguments)
@@ -480,8 +536,13 @@ def invoke(
             for item in registrations
         )
         record = ExecutionRecord(
-            uuid.uuid4().hex, "COMMITTED", action, principal, changes, tuple(execution.children)
+            execution_id, "COMMITTED", action, principal, changes, tuple(execution.children)
         )
+        envelopes = tuple(
+            envelope(item, execution_id=execution_id, action=action, approver=None)
+            for item in execution.pending_effects
+        )
+
         ledger_entry: LedgerEntry | None = None
         if request_key is not None and scope is not None and fingerprint is not None:
             ledger_entry = LedgerEntry(
@@ -494,14 +555,30 @@ def invoke(
                 encode_result(_stored_result(record)),
             )
         results = commit_guarded_writes(
-            provider, bound_session(bound), writes, entry=ledger_entry, unit=unit
+            provider,
+            bound_session(bound),
+            writes,
+            entry=ledger_entry,
+            unit=unit,
+            effects=envelopes,
+            bound=bound,
         )
+
     except BusinessRejected as exc:
         discard_unit(unit)
         return _rejected(action, principal, str(exc), _children(execution))
+    except OutboxError as exc:
+        discard_unit(unit)
+        return _outcome(
+            "DENIED",
+            str(exc),
+            request_key=request_key,
+            intent_fingerprint=fingerprint,
+        )
     except DuplicateRequest:
         discard_unit(unit)
         return _duplicate_outcome(provider, scope, request_key, fingerprint)
+
     except (InvokeDenied, UnboundWriteAttempt, ValueError, PermissionError) as exc:
         discard_unit(unit)
         detail = str(exc) if isinstance(exc, InvokeDenied) else _DENIED_DETAIL
@@ -664,12 +741,13 @@ def _guarded(
 
 @dataclass(frozen=True, slots=True)
 class RecomputedPlan:
-    """A fresh handler run: guarded registrations, children, resolved arguments."""
+    """A fresh handler run: guarded registrations, children, effects and args."""
 
     registrations: tuple[_Registration, ...]
     children: tuple[DefinitionKey, ...]
     arguments: Mapping[str, object]
     declaration: type[Action]
+    effects: tuple[EffectIntent, ...] = ()
 
 
 def recompute_action(
@@ -682,6 +760,7 @@ def recompute_action(
     grants: Mapping[DefinitionKey, ReadGrant],
     parameters: Mapping[str, object],
     allow_version_change: bool = False,
+    execution_id: str | None = None,
 ) -> RecomputedPlan:
     """Run a pinned root and its children once on the current world, without committing."""
     entry = linked_action(linked, action, bound)
@@ -690,10 +769,8 @@ def recompute_action(
         raise InvokeDenied("the requester lacks the action's invoke permission.")
     if declaration.approval is None:
         raise InvokeDenied("only an approval-declared action can be resumed.")
-    if declaration.effects:
-        raise InvokeDenied(
-            "this declaration needs effect governance a synchronous invoke cannot honor."
-        )
+    effects = _effects_for(declaration, linked, bound)
+
     arguments = _arguments(
         entry,
         action,
@@ -706,7 +783,18 @@ def recompute_action(
     columns = {identity: tuple(spec.columns) for identity, spec in provider.resources.items()}
     allowed_writes = declared_writes(linked, declaration.writes)
     require_writes(bound, allowed_writes)
-    execution = _Execution(linked, bound, provider, grants, columns, [], [])
+    execution = _Execution(
+        linked,
+        bound,
+        provider,
+        grants,
+        columns,
+        [],
+        [],
+        effects=effects,
+        bound_effects=bound.effects,
+        execution_id=execution_id or uuid.uuid4().hex,
+    )
     ctx = HandlerCtx(
         principal=principal,
         reads=defined_keys(linked, declaration.reads),
@@ -714,11 +802,16 @@ def recompute_action(
         calls=bound.calls,
         delegations=bound.delegations,
         execution=execution,
+        effects=effects,
     )
     handler = cast(Callable[..., object], vars(declaration)["handler"])
     handler(declaration(), ctx, **arguments)
     return RecomputedPlan(
-        tuple(execution.registrations), tuple(execution.children), arguments, declaration
+        tuple(execution.registrations),
+        tuple(execution.children),
+        arguments,
+        declaration,
+        tuple(execution.pending_effects),
     )
 
 

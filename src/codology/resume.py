@@ -49,6 +49,8 @@ from codology.manifest import (
     manifest_digest,
     resolve_manifest,
 )
+from codology.outbox import EffectEnvelope, OutboxError
+from codology.outbox import envelope as effect_envelope
 from codology.ports import (
     ApplyResult,
     CommitOutcomeUnknown,
@@ -160,6 +162,8 @@ class ResumeUnitOfWork(Protocol):
     def find_outcome(self, callback_key: str) -> ResumeOutcome | None: ...
 
     def apply(self, write: GuardedWrite) -> ApplyResult: ...
+
+    def record_effect(self, envelope: EffectEnvelope) -> bool: ...
 
     def transition_committed(
         self, execution_id: str, fingerprint: str, action_version: str, payload: str
@@ -397,6 +401,18 @@ def _commit_body(ctx: _Context, unit: ResumeUnitOfWork, state: _UnitState) -> Ac
     applied: list[ApplyResult] = []
     for write in writes:
         applied.append(unit.apply(write))
+    envelopes = tuple(
+        effect_envelope(
+            item,
+            execution_id=ctx.execution_id,
+            action=ctx.action,
+            approver=ctx.decision.principal,
+        )
+        for item in ctx.plan.effects
+    )
+    for intent in envelopes:
+        unit.record_effect(intent)
+
     if not unit.transition_committed(
         ctx.execution_id, ctx.snapshot.intent_fingerprint, ctx.action.version, payload
     ):
@@ -527,6 +543,9 @@ def _transact(
         return body(unit, state)
     except StalePlan:
         return _stale()
+    except OutboxError as exc:
+        return _denied(str(exc))
+
     except _Raced:
         snapshot = provider.find_execution(execution_id)
         decision = provider.read_decision(callback_key)
@@ -602,11 +621,15 @@ def _preflight(
 
     if bound.action != resolved.manifest.root.key or waiting.action != bound.action:
         return _denied("the bound plan is not the pinned root revision.")
+    pinned_effects = {entry.key for entry in resolved.manifest.effects}
+    if pinned_effects != {item.definition for item in bound.effects}:
+        return _denied("the bound effect revisions are not the pinned effect set.")
     declaration = resolved.root.definition.declaration
     if not issubclass(declaration, Action):
         return _denied("the pinned root is not an Action.")
-    if declaration.approval is None or declaration.effects:
-        return _denied("the pinned root needs governance this resume cannot honor.")
+    if declaration.approval is None:
+        return _denied("the pinned root has no approval declaration.")
+
     if declaration.permission not in principal.permissions:
         return _denied("the requester lacks the action's live invoke permission.")
 
@@ -628,6 +651,7 @@ def _preflight(
             grants=grants,
             parameters=waiting.canonical_input,
             allow_version_change=True,
+            execution_id=execution_id,
         )
     except BusinessRejected as exc:
         rejection = _RejectInput(

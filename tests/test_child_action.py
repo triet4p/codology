@@ -16,6 +16,7 @@ from codology import (
     DelegationGrant,
     DelegationPrincipal,
     Deployment,
+    EffectSessionMismatch,
     Enlistment,
     ModuleDeclarations,
     NoSharedTransaction,
@@ -571,17 +572,7 @@ def test_static_tier_three_declaration_is_not_runnable_as_tier_two(tmp_path: Pat
         )
     )
     action = DefinitionKey("procurement.approve_purchase_order", "2.0.0")
-
-    result = _invoke(
-        path,
-        linked=graph,
-        action=action,
-        parameters={},
-        grants={_ORDER_KEY: _grant(_ORDER_KEY)},
-        caller=action.identity,
-    )
-
-    assert result.attempt.code == "DENIED"
-    assert result.execution is None
+    with pytest.raises(EffectSessionMismatch, match="codology.outbox"):
+        bind_action(snapshot(graph), _deployment(), action)
     assert _orders(path) == ("PENDING_APPROVAL", None, 1)
     assert _budget(path) == (100_000, 0, 1)

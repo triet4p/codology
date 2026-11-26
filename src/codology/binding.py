@@ -29,6 +29,7 @@ class Capability(StrEnum):
     """A capability a provider can claim for deployment binding."""
 
     ATOMIC_TRANSACTION = "atomic_transaction"
+    OUTBOX = "outbox"
 
 
 class DelegationPrincipal(StrEnum):
@@ -74,6 +75,10 @@ class NoSharedTransaction(BindingError):
     """Required writes span independent sessions instead of one physical session."""
 
 
+class EffectSessionMismatch(BindingError):
+    """A declared effect's outbox is enlisted outside the business session."""
+
+
 class InconsistentSession(BindingError):
     """One session label is claimed by two providers, so it cannot be trusted."""
 
@@ -107,6 +112,7 @@ class Provider:
     name: str
     kind: str
     capabilities: frozenset[Capability] = frozenset()
+    effect_dedup: str | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.name, "Provider.name")
@@ -115,9 +121,10 @@ class Provider:
         for capability in capabilities:
             if not isinstance(cast(object, capability), Capability):
                 raise ValueError(
-                    "Provider.capabilities must contain Capability members; "
-                    f"found {capability!r}."
+                    f"Provider.capabilities must contain Capability members; found {capability!r}."
                 )
+        if self.effect_dedup is not None:
+            _require_text(self.effect_dedup, "Provider.effect_dedup")
         object.__setattr__(self, "capabilities", capabilities)
 
 
@@ -190,6 +197,16 @@ class BoundWrite:
 
 
 @dataclass(frozen=True, slots=True)
+class BoundEffect:
+    """One declared effect pinned to the durable dedup store and session."""
+
+    definition: DefinitionKey
+    provider: str
+    session: str
+    dedup: str
+
+
+@dataclass(frozen=True, slots=True)
 class BoundCall:
     """One declared call edge with the child contract it resolves to."""
 
@@ -227,6 +244,10 @@ class BoundAction:
     calls: tuple[BoundCall, ...]
     delegations: tuple[BoundDelegation, ...]
     session: SessionPlan | None
+    effects: tuple[BoundEffect, ...] = ()
+
+
+OUTBOX_RESOURCE = "codology.outbox"
 
 
 type _CallEdge = tuple[DefinitionKey, DefinitionKey, str]
@@ -272,6 +293,7 @@ def bind_action(
     calls = _bind_calls(published, call_edges)
     delegations = _check_delegations(deployment, action, calls)
     writes, session = _plan_session(deployment, action, requires_atomic, writes_found)
+    effects = _plan_effects(deployment, action, entry, session)
     return BoundAction(
         action=action,
         commit_requirement=entry.commit_requirement,
@@ -279,6 +301,7 @@ def bind_action(
         calls=calls,
         delegations=delegations,
         session=session,
+        effects=effects,
     )
 
 
@@ -482,3 +505,68 @@ def _enlistment_index(deployment: Deployment, action: DefinitionKey) -> dict[str
             )
         index[enlistment.resource] = enlistment
     return index
+
+
+def _plan_effects(
+    deployment: Deployment,
+    action: DefinitionKey,
+    entry: SnapshotEntry,
+    session: SessionPlan | None,
+) -> tuple[BoundEffect, ...]:
+    """Bind declared effects to one outbox store inside the business session."""
+    targets = tuple(
+        _target(dependency, action, "effects")
+        for dependency in entry.dependencies
+        if dependency.field == "effects"
+    )
+    if not targets:
+        return ()
+    if session is None:
+        raise EffectSessionMismatch(
+            "declared effects need an enlisted outbox session; the action has no write session.",
+            action=action,
+            field="effects",
+        )
+    providers = {provider.name: provider for provider in deployment.providers}
+    enlistments = _enlistment_index(deployment, action)
+    enlistment = enlistments.get(OUTBOX_RESOURCE)
+    if enlistment is None:
+        raise EffectSessionMismatch(
+            f"declared effects need an enlistment for {OUTBOX_RESOURCE!r} in session "
+            f"{session.session!r}.",
+            action=action,
+            field="effects",
+        )
+    if enlistment.session != session.session or enlistment.provider != session.provider:
+        raise EffectSessionMismatch(
+            f"the outbox is enlisted in session {enlistment.session!r} on provider "
+            f"{enlistment.provider!r}, but business writes use {session.session!r} on "
+            f"{session.provider!r}; an effect must commit in the same transaction.",
+            action=action,
+            field="effects",
+        )
+    provider = providers.get(enlistment.provider)
+    if provider is None:
+        raise UnknownProvider(
+            f"the outbox provider {enlistment.provider!r} is not declared by the deployment.",
+            action=action,
+            field="effects",
+        )
+    if Capability.OUTBOX not in provider.capabilities:
+        raise MissingCapability(
+            f"provider {provider.name!r} does not declare "
+            f"{Capability.OUTBOX.value!r}; declared effects cannot be bound.",
+            action=action,
+            field="capabilities",
+        )
+    if not provider.effect_dedup:
+        raise MissingCapability(
+            f"provider {provider.name!r} declares no effect_dedup store; declared effects "
+            "need durable dedup at binding time.",
+            action=action,
+            field="effect_dedup",
+        )
+    return tuple(
+        BoundEffect(target, provider.name, enlistment.session, provider.effect_dedup)
+        for target in targets
+    )

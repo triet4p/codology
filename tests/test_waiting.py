@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+import pytest
 
 from codology import (
     EXECUTION_READ_PERMISSION,
@@ -13,7 +16,9 @@ from codology import (
     DelegationGrant,
     DelegationPrincipal,
     Deployment,
+    EffectSessionMismatch,
     Enlistment,
+    MissingCapability,
     ModuleDeclarations,
     OrderBy,
     Principal,
@@ -590,9 +595,10 @@ class NotifyEffect(Effect):
 
 
 class GuardedEffectAction(Action):
-    """Approval plus an effect: effects are still unsupported at this gate."""
+    """An effect declaration whose handler must never run without a bound outbox."""
 
     identity = "procurement.guarded_effect"
+
     version = "1.0.0"
 
     order: ObjectRef[PurchaseOrder]
@@ -609,7 +615,7 @@ class GuardedEffectAction(Action):
     effects = (NotifyEffect,)
 
     def handler(self, ctx: HandlerCtx, order: PurchaseOrder, reason: str) -> None:
-        raise AssertionError("an unsupported effect declaration must not run a handler")
+        raise AssertionError("an unbound effect declaration must not run a handler")
 
 
 class ProcurementWithEffect(Module):
@@ -618,7 +624,7 @@ class ProcurementWithEffect(Module):
     exports = (PurchaseOrder, GuardedEffectAction, Notice, NotifyEffect)
 
 
-def test_declared_effects_still_fail_closed_at_invoke(tmp_path: Path) -> None:
+def test_effect_binding_is_rejected_before_handler_when_outbox_is_missing(tmp_path: Path) -> None:
     path = _database(tmp_path, amount=120_000)
     graph = link(
         load(
@@ -630,16 +636,18 @@ def test_declared_effects_still_fail_closed_at_invoke(tmp_path: Path) -> None:
         )
     )
     action = DefinitionKey("procurement.guarded_effect", "1.0.0")
-    result = invoke(
-        linked=graph,
-        action=action,
-        bound=bind_action(snapshot(graph), _deployment(), action),
-        provider=_provider(path),
-        principal=_principal(_APPROVE),
-        grants={_ORDER_KEY: _grant(_ORDER_KEY)},
-        parameters={"order": _parameters(path)["order"], "reason": "ship it"},
-        request_key="tenant-a:alice:effect:PO-1:001",
+    snapshot_graph = snapshot(graph)
+    with pytest.raises(EffectSessionMismatch, match="codology.outbox"):
+        bind_action(snapshot_graph, _deployment(), action)
+    enlisted = replace(
+        _deployment(),
+        enlistments=(
+            *_deployment().enlistments,
+            Enlistment("codology.outbox", "orders-db", _SESSION),
+        ),
     )
-    assert result.attempt.code == "DENIED"
-    assert _ledger(path) == []
+
+    with pytest.raises(MissingCapability, match="outbox"):
+        bind_action(snapshot_graph, enlisted, action)
+    assert _rows(path, "outbox") == []
     assert _rows(path, "purchase_orders")[0][3] == "PENDING"

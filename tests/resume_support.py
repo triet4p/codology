@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from codology import (
+    OUTBOX_RESOURCE,
     Capability,
     DefinitionKey,
     DelegationGrant,
@@ -25,12 +26,13 @@ from codology import (
     bind_action,
     link,
     load,
+    payload_of,
     query,
     snapshot,
 )
 from codology.adapter import ResourceBinding, SQLiteProvider
 from codology.decision import ApprovalAuthority, DecisionResult, approve
-from codology.declarations import Action, Module, ObjectRef, ObjectType, all_of
+from codology.declarations import Action, Effect, Module, ObjectRef, ObjectType, Value, all_of
 from codology.declarations.behavior import Approval, Param
 from codology.engine import ActionResult, HandlerCtx, invoke
 from codology.linking import LinkedDeclarations
@@ -75,7 +77,9 @@ CREATE TABLE request_ledger (
     PRIMARY KEY (tenant, principal, action, request_key)
 );
 CREATE INDEX ledger_execution ON request_ledger(execution_id);
-CREATE TABLE outbox (id TEXT PRIMARY KEY, dedup_id TEXT NOT NULL, payload TEXT NOT NULL);
+CREATE TABLE outbox (id TEXT PRIMARY KEY, dedup_id TEXT NOT NULL, payload TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING');
+
 CREATE TABLE approval_decisions (
     callback_key TEXT PRIMARY KEY, execution_id TEXT NOT NULL,
     approval_id TEXT NOT NULL, decision TEXT NOT NULL,
@@ -150,6 +154,21 @@ class ReserveBudgetLater(Action):
         raise AssertionError("the unpinned child handler must not run")
 
 
+class OrderApprovedPayload(Value):
+    identity = "procurement.order_approved_payload"
+    version = "1.0.0"
+
+    order: ObjectRef[PurchaseOrder]
+    approved_amount: int
+
+
+class NotifyWarehouse(Effect):
+    identity = "procurement.warehouse_order_approved"
+    version = "1.0.0"
+    payload = OrderApprovedPayload
+    dedupKey = ("order",)
+
+
 class ApproveOrder(Action):
     identity = ROOT
     version = "2.0.0"
@@ -162,6 +181,8 @@ class ApproveOrder(Action):
     writes = (PurchaseOrder,)
     calls = (RESERVE,)
     permission = APPROVE_PERMISSION
+    effects = (NotifyWarehouse,)
+
     approval = Approval.conditional(
         when=all_of(Param("order").amount >= 100_000, Param("reason") != ""),
         role=ROLE,
@@ -173,6 +194,10 @@ class ApproveOrder(Action):
         ctx.require(bool(reason.strip()), reason="reason_required")
         ctx.call(RESERVE, budget=budget, amount=order.amount, expectedVersion=budget.version)
         ctx.uow.register_mutation(order, status="APPROVED", expectedVersion=order.version)
+        ctx.uow.enqueue_effect(
+            NotifyWarehouse,
+            payload=payload_of(OrderApprovedPayload, order=order.ref, approved_amount=order.amount),
+        )
 
 
 class ApproveOrderLater(Action):
@@ -189,6 +214,8 @@ class ApproveOrderLater(Action):
     writes = (PurchaseOrder,)
     calls = (RESERVE,)
     permission = APPROVE_PERMISSION
+    effects = (NotifyWarehouse,)
+
     approval = Approval.conditional(
         when=all_of(Param("order").amount >= 100_000, Param("reason") != ""),
         role=ROLE,
@@ -202,13 +229,13 @@ class ApproveOrderLater(Action):
 class Procurement(Module):
     identity = "procurement"
     version = "1.0.0"
-    exports = (PurchaseOrder, ApproveOrder)
+    exports = (PurchaseOrder, ApproveOrder, OrderApprovedPayload, NotifyWarehouse)
 
 
 class ProcurementLater(Module):
     identity = "procurement"
     version = "1.0.0"
-    exports = (PurchaseOrder, ApproveOrderLater)
+    exports = (PurchaseOrder, ApproveOrderLater, OrderApprovedPayload, NotifyWarehouse)
 
 
 class Finance(Module):
@@ -225,13 +252,18 @@ class FinanceLater(Module):
 
 OLD_GRAPH = link(
     load(
-        ModuleDeclarations(Procurement, (PurchaseOrder, ApproveOrder)),
+        ModuleDeclarations(
+            Procurement, (PurchaseOrder, ApproveOrder, OrderApprovedPayload, NotifyWarehouse)
+        ),
         ModuleDeclarations(Finance, (Budget, ReserveBudget)),
     )
 )
 LATER_GRAPH = link(
     load(
-        ModuleDeclarations(ProcurementLater, (PurchaseOrder, ApproveOrderLater)),
+        ModuleDeclarations(
+            ProcurementLater,
+            (PurchaseOrder, ApproveOrderLater, OrderApprovedPayload, NotifyWarehouse),
+        ),
         ModuleDeclarations(FinanceLater, (Budget, ReserveBudgetLater)),
     )
 )
@@ -346,6 +378,8 @@ class HookedProvider(ResumeSQLiteProvider):
             self._provider.ledger_table,
             self._provider.decision_table,
             self.resume_table,
+            self._provider.outbox_table,
+            self._provider.effect_dedup,
             mode=self.commit_mode,
         )
 
@@ -393,6 +427,7 @@ def sqlite(path: Path) -> SQLiteProvider:
                 scope_column="scope",
             ),
         ),
+        effect_dedup="sqlite:outbox",
     )
 
 
@@ -402,10 +437,18 @@ def provider(path: Path) -> ResumeSQLiteProvider:
 
 def deployment() -> Deployment:
     return Deployment(
-        providers=(Provider("orders-db", "sqlite", frozenset({Capability.ATOMIC_TRANSACTION})),),
+        providers=(
+            Provider(
+                "orders-db",
+                "sqlite",
+                frozenset({Capability.ATOMIC_TRANSACTION, Capability.OUTBOX}),
+                "sqlite:outbox",
+            ),
+        ),
         enlistments=(
             Enlistment(ORDER, "orders-db", SESSION),
             Enlistment(BUDGET, "orders-db", SESSION),
+            Enlistment(OUTBOX_RESOURCE, "orders-db", SESSION),
         ),
         delegations=(
             DelegationGrant(ROOT, RESERVE, RESERVE_PERMISSION, DelegationPrincipal.REQUESTER),

@@ -28,6 +28,8 @@
 
 - Added an approval decision gate: `engine.approve()` and `engine.reject()` bind each callback to the current approval's key and material-intent fingerprint, check live approver role/permission, tenant, scope, `self_approval`, expiry and revocation supplied by the host, and record accepted decisions with a separate audit of every attempt. Replay under the same key rechecks authority, changed payloads are `KEY_MISUSE`, denied attempts do not claim the key, a valid reject ends once in `REJECTED` without business writes, and a valid approve is an input to resume rather than a commit.
 - Added an atomic resume gate: `resume()` re-resolves the pinned manifest, reruns the pinned root and child logic on current data, rechecks requester and approver authority and compares the material intent before one guarded commit. Expiry, revocation or a changed intent mints a new approval with a new callback key and fingerprint; stale guards and interrupted commits stay retryable, and the decision outcome is stored with its ledger transition.
+- Added a transactional outbox for declared effects: handlers snapshot a typed `Value` payload and the engine assigns a stable dedup ID, then writes one pending intent in the same SQLite transaction as the order, budget, ledger and resume decision. Deployment binding rejects missing outbox capability, missing durable dedup or a session split away from the business writes before any handler runs; undeclared effects, wrong payload types and pre-commit failures leave no deliverable row, while awaiting approval, reject and replay add none.
+
 
 ### Fixed
 

@@ -21,10 +21,12 @@ from codology.adapter import (
     SQLiteProvider,
     _encode,  # pyright: ignore[reportPrivateUsage]
     _identifier,  # pyright: ignore[reportPrivateUsage]
+    _record_effect,  # pyright: ignore[reportPrivateUsage]
 )
 from codology.binding import SessionPlan
 from codology.decision import DecisionRecord, ExecutionSnapshot, stored_decision
 from codology.ledger import LedgerEntry, RequestScope
+from codology.outbox import EffectEnvelope
 from codology.ports import (
     ApplyResult,
     CommitOutcomeUnknown,
@@ -130,7 +132,7 @@ def _decision_record(
 
 
 class ResumeSQLiteUnit:
-    """One write transaction for resume guards, ledger and decision outcome."""
+    """One write transaction for resume guards, ledger, decision and outbox."""
 
     def __init__(
         self,
@@ -139,12 +141,17 @@ class ResumeSQLiteUnit:
         ledger_table: str,
         decision_table: str,
         resume_table: str,
+        outbox_table: str = "outbox",
+        effect_dedup: str | None = None,
     ) -> None:
         self._connection = connection
         self._resources = resources
         self._ledger_table = ledger_table
         self._decision_table = decision_table
         self._resume_table = resume_table
+        self._outbox_table = _identifier(outbox_table, "outbox_table")
+        self._effect_dedup = effect_dedup
+
         self._transaction = f"resume#{id(connection):x}"
         self._transaction_ended = False
         self._connection_closed = False
@@ -177,6 +184,10 @@ class ResumeSQLiteUnit:
     def apply(self, write: GuardedWrite) -> ApplyResult:
         self._require_open()
         return _apply_guarded(self._connection, self._resources, write, self._transaction)
+
+    def record_effect(self, envelope: EffectEnvelope) -> bool:
+        self._require_open()
+        return _record_effect(self._connection, self._outbox_table, self._effect_dedup, envelope)
 
     def transition_committed(
         self, execution_id: str, fingerprint: str, action_version: str, payload: str
@@ -333,6 +344,8 @@ class ResumeSQLiteProvider:
             self._provider.ledger_table,
             self._provider.decision_table,
             self.resume_table,
+            self._provider.outbox_table,
+            self._provider.effect_dedup,
         )
 
 

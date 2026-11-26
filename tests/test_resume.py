@@ -38,7 +38,8 @@ def test_resume_commits_once_with_pinned_revisions_and_decision_outcome(tmp_path
     assert (order[3], order[6]) == ("APPROVED", 2)
     assert (budget[4], budget[5]) == (120_000, 2)
     assert rows(target.path, "request_ledger")[0][7] == "COMMITTED"
-    assert rows(target.path, "outbox") == []
+    assert len(rows(target.path, "outbox")) == 1
+
     outcomes = rows(target.path, "approval_resume_outcomes")
     assert len(outcomes) == 1 and outcomes[0][2] == "COMMITTED"
 

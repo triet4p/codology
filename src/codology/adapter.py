@@ -19,8 +19,9 @@ from codology.decision import (
     encode_principal,
     stored_decision,
 )
-from codology.ledger import DuplicateRequest, LedgerEntry, RequestScope
+from codology.ledger import DuplicateRequest, LedgerEntry, RequestScope, serialize
 from codology.money import MinorMoney
+from codology.outbox import EffectConflict, EffectEnvelope
 from codology.ports import (
     ApplyResult,
     CommitOutcomeUnknown,
@@ -132,6 +133,39 @@ def _require_text(value: object, label: str) -> str:
     return value
 
 
+def _record_effect(
+    connection: sqlite3.Connection,
+    table: str,
+    effect_dedup: str | None,
+    envelope: EffectEnvelope,
+) -> bool:
+    """Claim one pending outbox row; a dedup replay must carry the same snapshot."""
+    if not effect_dedup:
+        raise TransactionUnavailable("the outbox provider has no durable dedup store.")
+    document = serialize(envelope.document())
+    statement = f"SELECT payload FROM {table} WHERE dedup_id = ?"
+    try:
+        existing = connection.execute(statement, (envelope.intent.dedup_id,)).fetchone()
+    except sqlite3.OperationalError as exc:
+        raise TransactionUnavailable(f"outbox dedup lookup failed: {exc}") from exc
+    if existing is not None:
+        if str(existing[0]) != document:
+            raise EffectConflict(
+                f"dedup id {envelope.intent.dedup_id!r} already carries a different payload."
+            )
+        return False
+    insert = (
+        f"INSERT OR IGNORE INTO {table} (id, dedup_id, payload, status) VALUES (?, ?, ?, 'PENDING')"
+    )
+    try:
+        cursor = connection.execute(insert, (envelope.id, envelope.intent.dedup_id, document))
+    except sqlite3.OperationalError as exc:
+        raise TransactionUnavailable(f"outbox intent insert failed: {exc}") from exc
+    if cursor.rowcount != 1:
+        raise EffectConflict(f"outbox row {envelope.id!r} already exists with another payload.")
+    return True
+
+
 def _identifier(value: object, label: str) -> str:
     text = _require_text(value, label)
     if not _IDENTIFIER.fullmatch(text):
@@ -232,11 +266,15 @@ class SQLiteUnitOfWork:
         transaction: str,
         resources: Mapping[str, ResourceBinding],
         ledger_table: str,
+        outbox_table: str = "outbox",
+        effect_dedup: str | None = None,
     ) -> None:
         self._connection = connection
         self._transaction = transaction
         self._resources = resources
         self._ledger_table = ledger_table
+        self._outbox_table = _identifier(outbox_table, "outbox_table")
+        self._effect_dedup = effect_dedup
         self._transaction_ended = False
         self._connection_closed = False
 
@@ -343,6 +381,11 @@ class SQLiteUnitOfWork:
             ) from exc
         except sqlite3.OperationalError as exc:
             raise TransactionUnavailable(f"ledger claim failed before commit: {exc}") from exc
+
+    def record_effect(self, envelope: EffectEnvelope) -> bool:
+        """Write a pending intent on this same transaction, never deliver it."""
+        self._require_open()
+        return _record_effect(self._connection, self._outbox_table, self._effect_dedup, envelope)
 
     def commit(self) -> None:
         self._require_open()
@@ -534,12 +577,19 @@ class SQLiteProvider:
         decision_table: str = "approval_decisions",
         audit_table: str = "approval_audit",
         timeout: float = 10.0,
+        outbox_table: str = "outbox",
+        effect_dedup: str | None = None,
     ) -> None:
         self.database = Path(database)
         self.session = _require_text(session, "session")
         self.ledger_table = _identifier(ledger_table, "ledger_table")
         self.decision_table = _identifier(decision_table, "decision_table")
         self.audit_table = _identifier(audit_table, "audit_table")
+        self.outbox_table = _identifier(outbox_table, "outbox_table")
+        if effect_dedup is not None:
+            self.effect_dedup = _require_text(effect_dedup, "effect_dedup")
+        else:
+            self.effect_dedup = None
         timeout_value = cast(object, timeout)
         if isinstance(timeout_value, bool) or not isinstance(timeout_value, int | float):
             raise TypeError("timeout must be a number of seconds.")
@@ -581,7 +631,14 @@ class SQLiteProvider:
             connection.close()
             raise
         transaction = f"{self.session}#{id(connection):x}"
-        return SQLiteUnitOfWork(connection, transaction, self.resources, self.ledger_table)
+        return SQLiteUnitOfWork(
+            connection,
+            transaction,
+            self.resources,
+            self.ledger_table,
+            self.outbox_table,
+            self.effect_dedup,
+        )
 
     def lookup(self, scope: RequestScope, request_key: str) -> LedgerEntry | None:
         """Read a committed result through a fresh, read-only connection."""
