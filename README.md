@@ -68,6 +68,7 @@ examples/procurement_finance/
   model.py           # ghép nhóm, load/link/snapshot
   scenarios.py       # sáu ca lỗi tĩnh có thể chạy
   __main__.py        # entry point của ví dụ
+  runtime.py         # contract nấc 2 riêng cho child action, không approval/effect
 tests/
   test_annotations.py
   test_behavior.py
@@ -81,6 +82,7 @@ tests/
   test_procurement_finance_integration.py
   test_snapshot.py
   test_invoke.py     # DENIED/REJECTED/StalePlan, ref scope, ctx hẹp, commit/rollback
+  test_child_action.py # child đã link, ủy quyền, scope, rollback, một transaction
   typing/
     valid_api.py     # assert_type cho bề mặt công khai
     invalid_api.py   # lỗi kiểu có chủ đích, mỗi ignore phải cần thiết
@@ -408,7 +410,33 @@ assert result.attempt.code == "COMMITTED"
 
 Handler chỉ nhận `HandlerCtx`: `principal` chỉ đọc, `reads`/`writes`/`calls` đúng khai báo, `require`, `resolve`, `call` và `uow.register_mutation`. Không có connection, credential, SQL, `commit` hay `rollback`; mutation chỉ được đăng ký trên object đã resolve và nằm trong write set đã bind. Engine revalidate version/scope trước khi commit rồi gọi `commit_guarded_writes()` trên đúng session đã bind: mọi write trong execution dùng chung một transaction vật lý, guard không khớp thì rollback toàn bộ.
 
-`ActionResult` gồm `attempt` (`code`: `COMMITTED`, `DENIED`, `REJECTED` hoặc `StalePlan`), `execution` và kết quả các write. `DENIED` và `StalePlan` không tạo execution record và không đổi DB; `REJECTED` do `ctx.require` là outcome nghiệp vụ có record terminal; `COMMITTED` mang record kèm các mutation đã chấp nhận. `ctx.call` chỉ dispatch khi đích nằm trong `calls`, có delegation grant đúng quyền của requester và có executor được cấu hình; gọi ngoài khai báo fail closed. Child nghiệp vụ, sổ request/result bền vững, replay theo `request_key` và effect vẫn nằm ngoài phạm vi cửa này.
+`ActionResult` gồm `attempt` (`code`: `COMMITTED`, `DENIED`, `REJECTED` hoặc `StalePlan`), `execution` và kết quả các write. `DENIED` và `StalePlan` không tạo execution record và không đổi DB; `REJECTED` do `ctx.require` là outcome nghiệp vụ có record terminal; `COMMITTED` mang record kèm các mutation đã chấp nhận và danh sách child revision đã chạy. `ctx.call` chỉ dispatch khi đích nằm trong `calls`, có delegation grant đúng quyền của requester và tồn tại ở đúng revision đã link; gọi ngoài khai báo fail closed. Sổ request/result bền vững, replay theo `request_key` và effect vẫn nằm ngoài phạm vi cửa này.
+
+## Child Action qua ủy quyền thu hẹp
+
+`ctx.call("finance.reserve_budget", ...)` chỉ dispatch tới Action đã khai báo trong `calls` và đã link ở đúng identity/version. Engine kiểm delegation grant của requester, quyền live của child (`budget.reserve`) và resolve lại ref qua grant hiện tại; child nhận `HandlerCtx` riêng với `reads`/`writes` của chính nó nhưng dùng chung registration list, nên mọi write của cha và con nằm trong một `commit_guarded_writes()` duy nhất. Child `REJECTED` hoặc `DENIED` làm toàn bộ execution không commit; write trực tiếp từ Procurement vào `Budget` và call không khai báo đều fail closed.
+
+```python
+result = invoke(
+    linked=linked,                    # graph nấc 2 của runtime.py
+    action=DefinitionKey("procurement.approve_purchase_order", "1.1.0"),
+    bound=bound,                      # delegation grant REQUESTER + budget.reserve
+    provider=provider,
+    principal=principal,              # cần purchase_order.approve và budget.reserve
+    grants=grants,
+    parameters={
+        "order": order_ref,
+        "budget": budget_ref,
+        "reason": "approved after budget check",
+        "amount": MinorMoney.from_decimal(Decimal("40000"), "USD"),
+    },
+)
+assert result.attempt.code == "COMMITTED"
+assert result.execution is not None
+assert result.execution.children == (DefinitionKey("finance.reserve_budget", "1.0.0"),)
+```
+
+`examples/procurement_finance/runtime.py` là contract nấc 2 riêng, tách khỏi ví dụ tĩnh nấc 3 trong `procurement.py`: không `approval`, không `effects` và handler thật chạy được. `invoke` từ chối declaration nấc 3 thay vì bỏ qua metadata để chạy demo. `tests/test_child_action.py` kiểm revision đã link, export/call đã khai báo, quyền và scope của requester, rollback khi child từ chối và một transaction vật lý cho cả hai write.
 
 ## Ví dụ Procurement/Finance
 
@@ -430,14 +458,15 @@ Không cần backend: handler chỉ là metadata và không được gọi. Hư�
 - **Adapter và tiền chính xác:** SQLite file-backed, một session vật lý cho mọi write đã bind; `MinorMoney` lưu số nguyên đơn vị nhỏ với một currency, không float và không FX.
 - **Đọc an toàn:** mọi row/count/cursor đi qua một cửa đã authorize; adapter SQLite chỉ nhận predicate có pushdown tương đương đã kiểm chứng, từ chối traversal `internal` và mọi traversal chưa có conformance thay vì lọc ngầm sau khi đọc.
 - **Invoke một handler:** quyền ghi được kiểm live ở cửa engine, ref chỉ có giá trị khi resolve lại dưới grant hiện tại; `ctx.require` tạo `REJECTED`, xung đột version/guard tạo `StalePlan`, lỗi cửa tạo `DENIED` mà không tạo execution. Commit là quyết định của engine sau revalidate, không phải của handler.
+- **Child action đã link:** `calls` và delegation grant được bind trước runtime; `ctx.call` chạy handler của đúng revision đã link với context thu hẹn theo `reads`/`writes` của child, dùng chung một UoW và một transaction. Child `REJECTED`/`DENIED` hủy toàn bộ execution; service identity và ref tự dựng không thay được requester.
 - Chi tiết và hệ quả cho các task sau: [`docs/official/design/implementation-baseline.md`](docs/official/design/implementation-baseline.md).
 
 ## Giới hạn
 
-- Đây vẫn là lớp mô hình tĩnh, deployment binding plan-check, adapter transaction có guarded write, cửa đọc có policy và cửa ghi `invoke()` một handler. Chưa có child nghiệp vụ qua ủy quyền đầy đủ, sổ yêu cầu/kết quả bền vững, replay/idempotency hay effect delivery.
+- Đây vẫn là lớp mô hình tĩnh, deployment binding plan-check, adapter transaction có guarded write, cửa đọc có policy và cửa ghi `invoke()` với child đã link. Chưa có sổ yêu cầu/kết quả bền vững, replay/idempotency, approval/effect hay effect delivery.
 - Load đã thu thập definition và kiểm tra identity/field; Link đã resolve reference, kiểm tra export/kind và chữ ký handler; snapshot đã công bố graph bất biến với lookup tường minh; `bind_action()` đã kiểm tra capability, write set và enlistment plan trên snapshot. Adapter transaction thật đã có; registry bền vững và publish artifact thuộc các task kế tiếp.
 - Predicate approval chỉ được lưu dạng cấu trúc; chưa có đánh giá ngưỡng, callback duyệt hay giao effect. `Function` dùng cùng quy ước `handler(self, ctx, ...)` với `Action` theo implementation baseline.
-- Bằng chứng invoke chỉ phủ handler đơn trên adapter SQLite đã bind: từ chối quyền/scope/type/ref cũ, `REJECTED`, guard stale, ghi ngoài declaration và một transaction cho execution. Không có tuyên bố về registry bền vững, replay sau mất phản hồi, child action, PostgreSQL/ERP hay sandbox handler trong-process.
+- Bằng chứng invoke chỉ phủ handler đơn và một child đã link trên adapter SQLite đã bind: từ chối quyền/scope/type/ref cũ, `REJECTED`, guard stale, ghi ngoài declaration, child sai revision/quyền/scope và một transaction cho execution. Không có tuyên bố về registry bền vững, replay sau mất phản hồi, approval/effect, PostgreSQL/ERP hay sandbox handler trong-process.
 - Static validation không phát hiện truy cập ẩn trong thân handler (import lén, `getattr` động, đọc file/socket). Binding chỉ kiểm tra mapping khai báo; nó không phát hiện host code tự mở connection hoặc dùng credential ambient ngoài plan và không sandbox handler. Đó là rủi ro đã ghi nhận, xử lý bằng review và test.
 
 ## Tài liệu

@@ -4,7 +4,9 @@ A consumer never supplies a connection, a handler result, or its own mutation
 plan. The engine takes a linked graph and the deployment plan bound from that
 same graph, checks invoke authority and the current read scope, resolves every
 typed ref through the read port, runs one declared handler with a narrow context,
-revalidates the world, then commits one guarded transaction or changes nothing.
+and dispatches declared child handlers at their linked revisions into that same
+unit of work. It then revalidates the world and commits one guarded transaction
+or changes nothing.
 """
 
 from __future__ import annotations
@@ -80,9 +82,6 @@ class ScopedEngineProvider(Protocol):
     def begin(self, plan: SessionPlan) -> UnitOfWork: ...
 
 
-type ChildExecutor = Callable[[HandlerCtx, Mapping[str, object]], object]
-
-
 @dataclass(frozen=True, slots=True)
 class AttemptOutcome:
     """What the caller may know about one invoke attempt."""
@@ -110,6 +109,7 @@ class ExecutionRecord:
     action: DefinitionKey
     requester: Principal
     committed: tuple[CommittedChange, ...] = ()
+    children: tuple[DefinitionKey, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +159,19 @@ class _Registration:
     guards: tuple[Condition, ...]
 
 
+@dataclass(slots=True)
+class _Execution:
+    """State shared by one root handler and every declared child handler."""
+
+    linked: LinkedDeclarations
+    bound: BoundAction
+    provider: ScopedEngineProvider
+    grants: Mapping[DefinitionKey, ReadGrant]
+    columns: Mapping[str, tuple[str, ...]]
+    registrations: list[_Registration]
+    children: list[DefinitionKey]
+
+
 class ScopedUoW:
     """Mutation registration only; commit and rollback stay with the engine."""
 
@@ -168,10 +181,11 @@ class ScopedUoW:
         self,
         allowed: frozenset[str],
         columns: Mapping[str, tuple[str, ...]],
+        registrations: list[_Registration] | None = None,
     ) -> None:
         self._allowed = allowed
         self._columns = columns
-        self._registrations: list[_Registration] = []
+        self._registrations = [] if registrations is None else registrations
 
     def register_mutation(self, obj: object, **fields: object) -> None:
         """Register one guarded intent on a resolved object the action may write."""
@@ -210,12 +224,9 @@ class HandlerCtx:
 
     __slots__ = (
         "_calls",
-        "_columns",
         "_delegations",
-        "_executors",
-        "_grants",
+        "_execution",
         "_principal",
-        "_provider",
         "_reads",
         "_uow",
         "_writes",
@@ -229,21 +240,15 @@ class HandlerCtx:
         writes: frozenset[str],
         calls: tuple[BoundCall, ...],
         delegations: tuple[BoundDelegation, ...],
-        grants: Mapping[DefinitionKey, ReadGrant],
-        provider: ScopedEngineProvider,
-        executors: Mapping[DefinitionKey, ChildExecutor],
-        columns: Mapping[str, tuple[str, ...]],
+        execution: _Execution,
     ) -> None:
         self._principal = principal
         self._reads = reads
         self._writes = writes
         self._calls = calls
         self._delegations = delegations
-        self._grants = grants
-        self._provider = provider
-        self._executors = executors
-        self._columns = columns
-        self._uow = ScopedUoW(writes, columns)
+        self._execution = execution
+        self._uow = ScopedUoW(writes, execution.columns, execution.registrations)
 
     @property
     def principal(self) -> Principal:
@@ -280,10 +285,12 @@ class HandlerCtx:
         typed = cast(VersionedRef[object], ref)
         if typed.definition not in self._reads:
             raise InvokeDenied("the ref type is outside the declared read set.")
-        return _resolve_scoped(self._provider, self._principal, self._grants, typed)
+        return _resolve_scoped(
+            self._execution.provider, self._principal, self._execution.grants, typed
+        )
 
     def call(self, action: object, **params: object) -> object:
-        """Dispatch only a declared call under a checked requester delegation."""
+        """Dispatch one declared child Action at its linked revision under narrowed authority."""
         if not isinstance(action, str):
             raise InvokeDenied("a call names an action identity.")
         target = next(
@@ -296,12 +303,42 @@ class HandlerCtx:
             (item for item in self._delegations if item.callee == target.callee),
             None,
         )
-        if delegation is None or delegation.permission not in self._principal.permissions:
+        if delegation is None:
+            raise InvokeDenied("the call has no checked delegation grant.")
+        entry = self._execution.linked.definitions.get(target.callee.identity)
+        if entry is None or entry.definition.version != target.callee.version:
+            raise InvokeDenied("the declared child revision is not in the linked graph.")
+        raw = entry.definition.declaration
+        if not issubclass(raw, Action):
+            raise InvokeDenied("a declared call must target an Action.")
+        declaration = raw
+        if declaration.approval is not None or declaration.effects:
+            raise InvokeDenied(
+                "the child declaration needs governance a synchronous call cannot honor."
+            )
+        if declaration.permission != delegation.permission:
+            raise InvokeDenied("the delegation does not match the child's declared permission.")
+        if declaration.permission not in self._principal.permissions:
             raise InvokeDenied("the requester has no live delegated permission for this call.")
-        executor = self._executors.get(target.callee)
-        if executor is None:
-            raise InvokeDenied("no executor is configured for this declared call.")
-        return executor(self, params)
+
+        arguments = _child_arguments(entry, params, self._execution, self._principal)
+        child = HandlerCtx(
+            principal=self._principal,
+            reads=_defined_keys(self._execution.linked, declaration.reads),
+            writes=_declared_writes(self._execution.linked, declaration.writes),
+            calls=tuple(
+                bound for bound in self._execution.bound.calls if bound.caller == target.callee
+            ),
+            delegations=tuple(
+                item for item in self._execution.bound.delegations if item.caller == target.callee
+            ),
+            execution=self._execution,
+        )
+        self._execution.children.append(target.callee)
+        handler = vars(declaration).get("handler")
+        if not callable(handler):
+            raise InvokeDenied("the linked child has no callable handler.")
+        return handler(declaration(), child, **arguments)
 
 
 def invoke(
@@ -313,9 +350,9 @@ def invoke(
     principal: Principal,
     grants: Mapping[DefinitionKey, ReadGrant],
     parameters: Mapping[str, object],
-    child_executors: Mapping[DefinitionKey, ChildExecutor] = MappingProxyType({}),
 ) -> ActionResult:
-    """Run one declared handler behind the invoke gate and commit at most once."""
+    """Run one declared handler and its declared children, committing at most once."""
+    execution: _Execution | None = None
     try:
         entry = _entry(linked, action, bound)
         declaration = cast(type[Action], entry.definition.declaration)
@@ -327,34 +364,27 @@ def invoke(
             )
         arguments = _arguments(entry, action, parameters, provider, principal, grants)
         columns = {identity: tuple(spec.columns) for identity, spec in provider.resources.items()}
-        declared_writes = {getattr(raw, "identity", raw) for raw in declaration.writes}
-        allowed_writes = frozenset(
-            identity
-            for identity in (item.definition.identity for item in linked.all_definitions)
-            if identity is not None and identity in declared_writes
-        )
+        allowed_writes = _declared_writes(linked, declaration.writes)
         _require_plan_writes(bound, allowed_writes)
+        execution = _Execution(linked, bound, provider, grants, columns, [], [])
         ctx = HandlerCtx(
             principal=principal,
             reads=_defined_keys(linked, declaration.reads),
             writes=allowed_writes,
             calls=bound.calls,
             delegations=bound.delegations,
-            grants=grants,
-            provider=provider,
-            executors=child_executors,
-            columns=columns,
+            execution=execution,
         )
         handler = cast(Callable[..., object], vars(declaration)["handler"])
         handler(declaration(), ctx, **arguments)
 
-        registrations = ctx.uow.registrations
+        registrations = tuple(execution.registrations)
         if not registrations:
             raise InvokeDenied("a write-declaring action registered no mutation.")
         writes = _guarded(registrations, bound, provider, principal, grants)
         results = commit_guarded_writes(provider, _session(bound), writes)
     except BusinessRejected as exc:
-        return _rejected(action, principal, str(exc))
+        return _rejected(action, principal, str(exc), _children(execution))
     except (InvokeDenied, UnboundWriteAttempt, ValueError, PermissionError) as exc:
         detail = str(exc) if isinstance(exc, InvokeDenied) else _DENIED_DETAIL
         return _outcome("DENIED", detail)
@@ -378,6 +408,7 @@ def invoke(
             action=action,
             requester=principal,
             committed=committed,
+            children=tuple(execution.children),
         ),
         writes=tuple(results),
     )
@@ -434,6 +465,42 @@ def _arguments(
     return arguments
 
 
+def _child_arguments(
+    entry: LinkedDefinition,
+    parameters: Mapping[str, object],
+    execution: _Execution,
+    principal: Principal,
+) -> dict[str, object]:
+    """Resolve child parameters against the child's own linked contract and live scope."""
+    declaration = cast(type[Action], entry.definition.declaration)
+    if set(parameters) != set(declaration.properties):
+        raise InvokeDenied("child parameters must match the declared parameter names exactly.")
+    arguments: dict[str, object] = {}
+    for name in declaration.properties:
+        hint = entry.hints[name]
+        value = parameters[name]
+        if isinstance(hint, type) and issubclass(hint, ObjectRef):
+            if isinstance(value, ResolvedObject):
+                handle = cast(ResolvedObject[object], value)
+                value = handle.ref
+            expected = _ref_target(hint)
+            if not is_issued_ref(value):
+                raise InvokeDenied("a typed child ref needs a ref issued by an authorized query.")
+            typed = cast(VersionedRef[object], value)
+            if typed.definition != expected:
+                raise InvokeDenied("the child ref does not match the declared parameter type.")
+            arguments[name] = _resolve_scoped(
+                execution.provider, principal, execution.grants, typed
+            )
+            continue
+        if isinstance(hint, type) and not isinstance(value, hint):
+            raise InvokeDenied("a child parameter has the wrong declared type.")
+        if hint is int and isinstance(value, bool):
+            raise InvokeDenied("a boolean is not an integer child parameter.")
+        arguments[name] = value
+    return arguments
+
+
 def _ref_target(hint: type[object]) -> DefinitionKey:
     target = cast(object, getattr(hint, "target", None))
     identity = getattr(target, "identity", None)
@@ -484,6 +551,15 @@ def _defined_keys(linked: LinkedDeclarations, raw: Sequence[object]) -> frozense
     return frozenset(keys)
 
 
+def _declared_writes(linked: LinkedDeclarations, raw: Sequence[object]) -> frozenset[str]:
+    identities = {getattr(item, "identity", item) for item in raw}
+    return frozenset(
+        identity
+        for identity in (item.definition.identity for item in linked.all_definitions)
+        if identity is not None and identity in identities
+    )
+
+
 def _require_plan_writes(bound: BoundAction, allowed: frozenset[str]) -> None:
     session = _session(bound)
     writable = {item.identity for item in session.writes}
@@ -529,7 +605,16 @@ def _guarded(
     )
 
 
-def _rejected(action: DefinitionKey, principal: Principal, detail: str) -> ActionResult:
+def _children(execution: _Execution | None) -> tuple[DefinitionKey, ...]:
+    return () if execution is None else tuple(execution.children)
+
+
+def _rejected(
+    action: DefinitionKey,
+    principal: Principal,
+    detail: str,
+    children: tuple[DefinitionKey, ...] = (),
+) -> ActionResult:
     return ActionResult(
         attempt=AttemptOutcome("REJECTED", detail),
         execution=ExecutionRecord(
@@ -537,6 +622,7 @@ def _rejected(action: DefinitionKey, principal: Principal, detail: str) -> Actio
             status="REJECTED",
             action=action,
             requester=principal,
+            children=children,
         ),
     )
 
@@ -549,7 +635,6 @@ __all__ = [
     "ActionResult",
     "AttemptOutcome",
     "BusinessRejected",
-    "ChildExecutor",
     "CommittedChange",
     "ExecutionRecord",
     "HandlerCtx",

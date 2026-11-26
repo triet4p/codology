@@ -5,7 +5,6 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from types import MappingProxyType
 from typing import cast
 
 import pytest
@@ -51,7 +50,6 @@ _RESERVE = "budget.reserve"
 _READ = "purchase_order.read"
 
 _hook: Callable[[HandlerCtx, ResolvedObject[object], str], None] | None = None
-_executor_calls: list[str] = []
 
 
 class PurchaseOrder(ObjectType):
@@ -127,7 +125,9 @@ class ReserveBudget(Action):
     permission = _RESERVE
 
     def handler(self, ctx: HandlerCtx, budget: Budget) -> None:
-        raise AssertionError("the test executor, not this declaration, runs the child")
+        ctx.uow.register_mutation(
+            budget, balance=60_000, expectedVersion=cast(ResolvedObject[object], budget).version
+        )
 
 
 class CallReserve(Action):
@@ -138,7 +138,7 @@ class CallReserve(Action):
     budget: ObjectRef[Budget]
 
     reads = (PurchaseOrder, Budget)
-    writes = (PurchaseOrder, Budget)
+    writes = (PurchaseOrder,)
     calls = (_RESERVE_KEY.identity,)
     permission = _APPROVE
 
@@ -182,9 +182,8 @@ CREATE TABLE budgets (
 
 
 def pytest_runtest_setup() -> None:
-    global _hook, _executor_calls
+    global _hook
     _hook = None
-    _executor_calls = []
 
 
 def _database(tmp_path: Path) -> Path:
@@ -306,9 +305,6 @@ def _call(
     principal: Principal | None = None,
     scopes: tuple[str, ...] = (_SCOPE,),
     delegated: bool = False,
-    executors: Mapping[DefinitionKey, Callable[[HandlerCtx, Mapping[str, object]], object]] = (
-        MappingProxyType({})
-    ),
 ) -> ActionResult:
     grants = {
         _ORDER_KEY: _grant(_ORDER_KEY, scopes),
@@ -322,7 +318,6 @@ def _call(
         principal=principal if principal is not None else _principal(_APPROVE, _RESERVE),
         grants=grants,
         parameters=parameters,
-        child_executors=executors,
     )
 
 
@@ -563,17 +558,9 @@ def test_two_registered_writes_share_one_physical_transaction(tmp_path: Path) ->
 def test_declared_child_call_needs_live_requester_permission(tmp_path: Path) -> None:
     path = _database(tmp_path)
     provider = _provider(path)
-    principal = _principal(_APPROVE)
+    principal = _principal(_APPROVE, _RESERVE)
     order_ref = _ref(provider, principal, _grant(_ORDER_KEY), _ORDER_KEY)
     budget_ref = _ref(provider, principal, _grant(_BUDGET_KEY), _BUDGET_KEY)
-
-    def executor(ctx: HandlerCtx, params: Mapping[str, object]) -> None:
-        assert ctx.principal.identity == "alice" and _RESERVE in ctx.principal.permissions
-        _executor_calls.append("reserve")
-        budget = cast(ResolvedObject[object], params["budget"])
-        ctx.uow.register_mutation(budget, balance=60_000, expectedVersion=budget.version)
-
-    executors = MappingProxyType({_RESERVE_KEY: executor})
     before = _orders(path)
 
     denied = _call(
@@ -582,21 +569,20 @@ def test_declared_child_call_needs_live_requester_permission(tmp_path: Path) -> 
         {"order": order_ref, "budget": budget_ref},
         principal=Principal("alice", _TENANT, frozenset({_READ, _APPROVE})),
         delegated=True,
-        executors=executors,
     )
     assert denied.attempt.code == "DENIED"
     assert denied.execution is None
-    assert _executor_calls == [] and _orders(path) == before
+    assert _orders(path) == before and _budget(path) == (100_000, 1)
 
     allowed = _call(
         path,
         _CALL_KEY,
         {"order": order_ref, "budget": budget_ref},
         delegated=True,
-        executors=executors,
     )
     assert allowed.attempt.code == "COMMITTED"
-    assert _executor_calls == ["reserve"]
+    assert allowed.execution is not None
+    assert allowed.execution.children == (_RESERVE_KEY,)
     assert _budget(path) == (60_000, 2)
     assert _orders(path) == ("APPROVED", 40_000, 2)
 
