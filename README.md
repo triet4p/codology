@@ -1,10 +1,10 @@
 # Codology
 
-Codology (Ontology as Code) là lớp mô hình tĩnh cho phép developer khai báo thực thể, quan hệ và hành vi nghiệp vụ bằng Python, rồi kiểm tra mô hình trước khi kết nối backend. Package Python gốc là `codology`; OaC là tên khái niệm, không phải tên package.
+Codology (Ontology as Code) là framework khai báo thực thể, quan hệ và hành vi nghiệp vụ bằng Python. Mô hình được kiểm tra trước khi kết nối backend; engine nhúng chạy lát cắt thực thi nguyên tử đầu tiên trên SQLite. Package Python gốc là `codology`; OaC là tên khái niệm, không phải tên package.
 
 ## Trạng thái
 
-Repository đang ở Sprint 4 — Lát cắt thực thi nguyên tử. Phần đã có là project scaffold, hạ tầng khai báo tĩnh, deployment binding ở mức plan, adapter SQLite cho transaction vật lý với guarded write, cửa đọc `query` có policy, cửa ghi `invoke()` với UoW scoped và sổ yêu cầu/kết quả bền vững:
+Sprint 4 đã hoàn tất với lát cắt thực thi nguyên tử đồng bộ. [Sprint 5](docs/sprint-plans/sprint-5.md) mới ở giai đoạn lập kế hoạch cho chờ/resume approval và thông báo sau commit. Các phần đã có:
 
 - `codology` import được từ môi trường sạch, không cần database, credential hay backend SDK.
 - `codology.declarations` cung cấp primitive cấu trúc bất biến `Module`, `ObjectType`, `Value`, `Link` và `ObjectRef[T]`: identity/version tường minh, property có kiểu, link có target/cardinality/traversal và `exports` đóng băng.
@@ -504,14 +504,16 @@ Không cần backend: handler chỉ là metadata và không được gọi. Decl
 ## Giới hạn
 
 - Đây vẫn là lớp mô hình tĩnh, deployment binding plan-check, adapter transaction có guarded write, cửa đọc có policy, cửa ghi `invoke()` với child đã link và sổ yêu cầu/kết quả bền vững. `examples/atomic_approval/` chỉ là consumer mẫu trên SQLite một file; chưa có publish artifact, approval/effect hay effect delivery.
-- Load đã thu thập definition và kiểm tra identity/field; Link đã resolve reference, kiểm tra export/kind và chữ ký handler; snapshot đã công bố graph bất biến với lookup tường minh; `bind_action()` đã kiểm tra capability, write set và enlistment plan trên snapshot. Adapter transaction thật đã có; registry bền vững và publish artifact thuộc các task kế tiếp.
+- Load đã thu thập definition và kiểm tra identity/field; Link đã resolve reference, kiểm tra export/kind và chữ ký handler; snapshot đã công bố graph bất biến với lookup tường minh; `bind_action()` đã kiểm tra capability, write set và enlistment plan trên snapshot. Adapter transaction thật đã có; chưa có registry bền vững hay publish artifact.
 - Predicate approval chỉ được lưu dạng cấu trúc; chưa có đánh giá ngưỡng, callback duyệt hay giao effect. `Function` dùng cùng quy ước `handler(self, ctx, ...)` với `Action` theo implementation baseline.
 - Bằng chứng invoke chỉ phủ handler đơn, một child đã link và sổ yêu cầu/kết quả trên adapter SQLite đã bind: từ chối quyền/scope/type/ref cũ, `REJECTED`, guard stale, ghi ngoài declaration, child sai revision/quyền/scope, key trùng intent khác, race cùng key và hai đơn tranh một budget, split binding và replay sau mất phản hồi. Không có tuyên bố về publish artifact, approval/effect, PostgreSQL/ERP, mọi lịch trình interleaving hay sandbox handler trong-process.
 - Static validation không phát hiện truy cập ẩn trong thân handler (import lén, `getattr` động, đọc file/socket). Binding chỉ kiểm tra mapping khai báo; nó không phát hiện host code tự mở connection hoặc dùng credential ambient ngoài plan và không sandbox handler. Đó là rủi ro đã ghi nhận, xử lý bằng review và test.
 
 ## Tài liệu
 
-- [Sprint 4 plan](docs/sprint-plans/sprint-4.md)
+- [Roadmap](docs/PLAN.md)
+- [Sprint 4 — lát cắt đồng bộ đã hoàn tất](docs/sprint-plans/sprint-4.md)
+- [Sprint 5 — kế hoạch chờ duyệt và tiếp tục](docs/sprint-plans/sprint-5.md)
 - [Implementation baseline](docs/official/design/implementation-baseline.md)
 - [Developer Contract](docs/official/design/developer-contract.md)
 - [Framework Design v0.1](docs/official/design/framework-design-v0.1.md)
