@@ -10,6 +10,7 @@ from typing import assert_type, cast
 
 from codology import (
     AllOf,
+    ArtifactRevision,
     Assignment,
     Comparison,
     Condition,
@@ -23,17 +24,24 @@ from codology import (
     LoadedModule,
     MinorMoney,
     OrderBy,
+    PinnedManifest,
     Principal,
     QueryPage,
     QueryRow,
     ReadGrant,
+    ResolvedManifest,
     Snapshot,
     SnapshotEntry,
     VersionedRef,
     authorize_read,
+    decode_manifest,
+    encode_manifest,
     is_issued_ref,
     link,
     load,
+    manifest_digest,
+    pin_manifest,
+    resolve_manifest,
     snapshot,
 )
 from codology.declarations import ObjectRef
@@ -61,6 +69,17 @@ assert_type(entry, SnapshotEntry)
 assert_type(entry.dependencies, tuple[Dependency, ...])
 assert_type(published.versions_of("finance.budget"), tuple[str, ...])
 assert_type(DefinitionKey("finance.budget", "1.0.0"), DefinitionKey)
+
+pinned = pin_manifest(linked, DefinitionKey("procurement.approve_purchase_order", "2.0.0"))
+assert_type(pinned, PinnedManifest)
+assert_type(pinned.root, ArtifactRevision)
+assert_type(encode_manifest(pinned), str)
+assert_type(decode_manifest(encode_manifest(pinned)), PinnedManifest)
+assert_type(manifest_digest(pinned), str)
+resolved = resolve_manifest(pinned, linked)
+assert_type(resolved, ResolvedManifest)
+assert_type(resolved.root, LinkedDefinition)
+assert_type(resolved.definitions, Mapping[DefinitionKey, LinkedDefinition])
 
 assert_type(ObjectRef[Budget], type[ObjectRef])
 assert_type(MinorMoney.from_decimal(Decimal("12.34"), "VND", exponent=2), MinorMoney)
