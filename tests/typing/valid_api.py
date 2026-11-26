@@ -10,12 +10,16 @@ from typing import assert_type, cast
 
 from codology import (
     AllOf,
+    ApprovalAuthority,
+    ApprovalAuthorityProvider,
     ArtifactRevision,
     Assignment,
     AwaitingExecution,
     Comparison,
     ComparisonValue,
     Condition,
+    DecisionProvider,
+    DecisionResult,
     DefinitionKey,
     Dependency,
     GuardedWrite,
@@ -40,6 +44,7 @@ from codology import (
     SnapshotEntry,
     VersionedRef,
     approval_deadline,
+    approve,
     authorize_read,
     build_material_intent,
     decode_awaiting,
@@ -53,9 +58,11 @@ from codology import (
     manifest_digest,
     new_approval,
     pin_manifest,
+    reject,
     resolve_manifest,
     snapshot,
 )
+from codology.decision import decode_principal, encode_principal
 from codology.declarations import ObjectRef
 from codology.engine import ActionResult, AttemptOutcome
 from examples.procurement_finance.finance import Budget
@@ -179,4 +186,39 @@ assert approval is not None
 assert_type(
     evaluate_predicate(approval.when, {"order": object(), "reason": "x"}),
     PredicateEvaluation,
+)
+
+gate_authority = ApprovalAuthority(
+    frozenset({"finance_director"}),
+    frozenset({"purchase_order.approve"}),
+    "A",
+    ("team1",),
+)
+assert_type(gate_authority, ApprovalAuthority)
+assert_type(encode_principal(requester), str)
+assert_type(decode_principal(encode_principal(requester)), Principal | None)
+gate_provider = cast(DecisionProvider, None)
+gate_source = cast(ApprovalAuthorityProvider, None)
+assert_type(
+    approve(
+        provider=gate_provider,
+        authority_provider=gate_source,
+        principal=requester,
+        execution_id="EX-1",
+        callback_key="EX-1:AP-1",
+        expected_intent_fingerprint=required.intent_fingerprint,
+    ),
+    DecisionResult,
+)
+assert_type(
+    reject(
+        provider=gate_provider,
+        authority_provider=gate_source,
+        principal=requester,
+        execution_id="EX-1",
+        callback_key="EX-1:AP-1",
+        expected_intent_fingerprint=required.intent_fingerprint,
+        reason="budget withdrawn",
+    ),
+    DecisionResult,
 )
