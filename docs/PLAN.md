@@ -6,14 +6,14 @@ Package Python gốc của framework là `codology`; Ontology as Code (OaC) là 
 
 ## Milestones
 
-Mỗi sprint tương ứng một milestone. Sprint 1 và Sprint 2 đã hoàn tất; các mốc còn lại là thứ tự đề xuất. Mỗi dòng mô tả kết quả ở cuối sprint, không phải danh sách task.
+Mỗi sprint tương ứng một milestone. Sprint 1–3 đã hoàn tất theo các kế hoạch tương ứng; Sprint 4 đã lập kế hoạch, chưa triển khai. Sprint 5–6 là thứ tự đề xuất. Mỗi dòng mô tả kết quả ở cuối sprint, không phải danh sách task.
 
 | Sprint | Milestone | Kết quả mong đợi |
 | --- | --- | --- |
 | 1 · Đã xong | Nền tảng kiến trúc | Có [bốn nghiên cứu](sprint-plans/sprint-1.md) và [hướng thiết kế](official/design/architecture-direction.md) phân định trách nhiệm của Object, Action, Module, Governance, Engine và Adapter. Đây là cơ sở thiết kế, chưa phải API đã chốt. |
 | 2 · Đã xong | Hợp đồng nhìn từ phía developer | [Kế hoạch Sprint 2](sprint-plans/sprint-2.md): có [hợp đồng author](official/design/developer-contract.md) (Nấc 1–3), [hợp đồng consumer](official/design/consumer-contract.md) và [quy tắc tiến hóa + kiểm chứng đa miền](official/design/evolution-and-cross-domain.md). Chốt biểu diễn class-based declaration đầu tiên cho Sprint 3. |
-| 3 · Đã lập kế hoạch | Mô hình khai báo dùng được | [Kế hoạch Sprint 3](sprint-plans/sprint-3.md): developer định nghĩa Procurement và Finance trong code, nối hai module qua nghiệp vụ công khai và phát hiện tham chiếu sai trước khi kết nối backend. |
-| 4 · Dự kiến | Lát cắt thực thi đầu tiên | Ứng dụng đọc đơn theo quyền rồi gọi `ApprovePurchaseOrder` qua engine nhúng và một adapter thật. Duyệt đơn và giữ ngân sách cùng thành công hoặc cùng thất bại; backend không đáp ứng thì không được nhận lời hứa này. |
+| 3 · Đã xong | Mô hình khai báo dùng được | [Sprint 3](sprint-plans/sprint-3.md): có khai báo Python cho Procurement và Finance, Link kiểm tra tham chiếu liên module qua nghiệp vụ công khai và snapshot tĩnh bất biến; chưa cần backend. |
+| 4 · Đã lập kế hoạch | Lát cắt thực thi đầu tiên | [Sprint 4](sprint-plans/sprint-4.md): ứng dụng đọc đơn theo quyền rồi gọi `ApprovePurchaseOrder` qua engine nhúng và một adapter thật. Đơn, khoản giữ ngân sách và kết quả yêu cầu commit cùng nhau hoặc không ghi gì; deployment binding từ chối backend không có transaction chung. |
 | 5 · Dự kiến | Quy trình duyệt có thể chờ và tiếp tục | Đơn vượt ngưỡng chờ người có thẩm quyền. Khi tiếp tục, engine dùng phiên bản quy tắc ban đầu nhưng xét lại quyền và ngân sách hiện tại; lỗi gửi thông báo không làm duyệt đơn lần hai. |
 | 6 · Dự kiến | MVP có thể bàn giao và mở rộng | Một developer khác dùng tài liệu để thêm nghiệp vụ ngoài ca duyệt đơn mà không sửa lõi; một consumer khác gọi cùng hợp đồng mà không chép lại luật. Ghi rõ giới hạn mà phiên bản đầu thực sự hỗ trợ. |
 
