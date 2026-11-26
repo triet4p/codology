@@ -68,7 +68,8 @@ def _stored_entry(
     request_key: str,
     row: Sequence[object],
 ) -> LedgerEntry | None:
-    if row[3] != "COMMITTED":
+    status = str(row[3])
+    if status not in ("COMMITTED", "AWAITING_APPROVAL"):
         return None
     return LedgerEntry(
         scope,
@@ -76,7 +77,7 @@ def _stored_entry(
         str(row[0]),
         str(row[1]),
         str(row[2]),
-        "COMMITTED",
+        status,
         str(row[4]),
     )
 

@@ -134,6 +134,22 @@ from codology.snapshot import (
     snapshot,
 )
 from codology.uow import UnboundWriteAttempt, commit_guarded_writes
+from codology.waiting import (
+    APPROVAL_TTL,
+    AWAITING_STATUS,
+    AwaitingExecution,
+    ComparisonValue,
+    MaterialIntent,
+    ObjectVersion,
+    PredicateEvaluation,
+    RequiredApproval,
+    approval_deadline,
+    build_material_intent,
+    decode_awaiting,
+    encode_awaiting,
+    evaluate_predicate,
+    new_approval,
+)
 
 __version__ = "0.1.0"
 
@@ -249,4 +265,18 @@ __all__ = [
     "pin_manifest",
     "resolve_manifest",
     "snapshot",
+    "APPROVAL_TTL",
+    "AWAITING_STATUS",
+    "AwaitingExecution",
+    "ComparisonValue",
+    "MaterialIntent",
+    "ObjectVersion",
+    "PredicateEvaluation",
+    "RequiredApproval",
+    "approval_deadline",
+    "build_material_intent",
+    "decode_awaiting",
+    "encode_awaiting",
+    "evaluate_predicate",
+    "new_approval",
 ]

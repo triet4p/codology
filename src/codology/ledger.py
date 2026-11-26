@@ -19,6 +19,8 @@ from codology.ports import UnitOfWork
 from codology.query import Principal, VersionedRef
 from codology.snapshot import DefinitionKey
 
+LedgerStatus = Literal["COMMITTED", "AWAITING_APPROVAL"]
+
 EXECUTION_READ_PERMISSION = "execution.read"
 
 _MONEY_TAG = "__money__"
@@ -56,14 +58,14 @@ class RequestScope:
 
 @dataclass(frozen=True, slots=True)
 class LedgerEntry:
-    """One authoritative committed result stored under a scoped request key."""
+    """One authoritative result or waiting execution under a scoped request key."""
 
     scope: RequestScope
     request_key: str
     intent_fingerprint: str
     execution_id: str
     action_version: str
-    status: Literal["COMMITTED"]
+    status: LedgerStatus
     payload: str
 
     def __post_init__(self) -> None:
@@ -72,8 +74,8 @@ class LedgerEntry:
         _require_text(self.execution_id, "LedgerEntry.execution_id")
         _require_text(self.action_version, "LedgerEntry.action_version")
         _require_text(self.payload, "LedgerEntry.payload")
-        if self.status != "COMMITTED":
-            raise ValueError("only an authoritative COMMITTED result is stored.")
+        if self.status not in ("COMMITTED", "AWAITING_APPROVAL"):
+            raise ValueError("only an authoritative COMMITTED or waiting result is stored.")
 
 
 class LedgerUnitOfWork(UnitOfWork, Protocol):
@@ -148,6 +150,27 @@ def _restore(value: object) -> object:
             ):
                 return DefinitionKey(parts[0], parts[1])
             raise ValueError("a stored definition value is malformed.")
+        if len(document) == 1 and _REF_TAG in document:
+            parts = _as_sequence(document[_REF_TAG])
+            if parts is None or len(parts) != 3:
+                raise ValueError("a stored reference is malformed.")
+            definition = _as_mapping(parts[0])
+            key, version = parts[1], parts[2]
+            tagged = None
+            if definition is not None and len(definition) == 1 and _DEFINITION_TAG in definition:
+                tagged = _as_sequence(definition[_DEFINITION_TAG])
+            if (
+                tagged is None
+                or len(tagged) != 2
+                or not isinstance(tagged[0], str)
+                or not isinstance(tagged[1], str)
+                or not isinstance(key, str)
+                or not key
+                or isinstance(version, bool)
+                or not isinstance(version, int)
+            ):
+                raise ValueError("a stored reference is malformed.")
+            return VersionedRef.issue(DefinitionKey(tagged[0], tagged[1]), key, version)
         if _REF_TAG in document or len(document) != len({str(key) for key in document}):
             raise ValueError("a stored object value is malformed.")
         return {str(key): _restore(item) for key, item in document.items()}
@@ -321,4 +344,5 @@ __all__ = [
     "encode_result",
     "intent_fingerprint",
     "serialize",
+    "LedgerStatus",
 ]

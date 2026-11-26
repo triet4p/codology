@@ -13,35 +13,40 @@ that commit, so a replay returns the stored answer instead of running handlers.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Literal, Protocol, cast
+from typing import Protocol, cast
 
 from codology.binding import BoundAction, BoundCall, BoundDelegation, SessionPlan
 from codology.declarations import Action, ObjectRef
+from codology.gate_support import (
+    InvokeDenied,
+    bound_session,
+    declared_writes,
+    defined_keys,
+    discard_unit,
+    linked_action,
+    ref_target,
+    request_scope,
+    require_writes,
+)
 from codology.ledger import (
-    EXECUTION_READ_PERMISSION,
     DuplicateRequest,
     LedgerEntry,
-    LedgerProvider,
     LedgerUnitOfWork,
     RequestScope,
-    StoredChange,
-    StoredResult,
-    decode_result,
+    canonicalize,
     encode_result,
 )
 from codology.ledger import intent_fingerprint as compute_intent_fingerprint
 from codology.linking import LinkedDeclarations, LinkedDefinition
 from codology.money import MinorMoney
 from codology.ports import (
-    ApplyResult,
     Assignment,
     CommitOutcomeUnknown,
     Condition,
     GuardedWrite,
-    SetOp,
     StalePlan,
     TransactionUnavailable,
     UnitOfWork,
@@ -54,22 +59,39 @@ from codology.query import (
     authorize_read,
     is_issued_ref,
 )
+from codology.results import (
+    KEY_MISUSE_DETAIL as _KEY_MISUSE_DETAIL,
+)
+from codology.results import (
+    ActionResult,
+    AttemptOutcome,
+    CommittedChange,
+    ExecutionRecord,
+    reconcile,
+)
+from codology.results import (
+    duplicate_outcome as _duplicate_outcome,
+)
+from codology.results import (
+    outcome as _outcome,
+)
+from codology.results import (
+    replay as _replay,
+)
+from codology.results import (
+    stored_replay as _stored_replay,
+)
+from codology.results import (
+    stored_result as _stored_result,
+)
 from codology.snapshot import DefinitionKey
 from codology.uow import UnboundWriteAttempt, commit_guarded_writes
-
-InvokeCode = Literal["COMMITTED", "DENIED", "REJECTED", "StalePlan", "UNKNOWN"]
-ExecutionStatus = Literal["COMMITTED", "REJECTED"]
+from codology.waiting import ObjectVersion, build_awaiting, claim_awaiting_key
 
 _DENIED_DETAIL = "invoke request was refused by the engine gate."
 _STALE_DETAIL = "the resolved world changed; re-read and recompute before retrying."
-_KEY_MISUSE_DETAIL = "the request key and intent do not match the stored result."
-_UNKNOWN_DETAIL = "no authoritative result is available for this request."
 _UNAVAILABLE_DETAIL = "the bound transaction did not complete; no commit was confirmed."
 _SEAL = object()
-
-
-class InvokeDenied(ValueError):
-    """A request, ref, or context capability failed a closed engine gate."""
 
 
 class BusinessRejected(ValueError):
@@ -102,49 +124,6 @@ class ScopedEngineProvider(Protocol):
     def begin(self, plan: SessionPlan) -> UnitOfWork: ...
 
     def lookup(self, scope: RequestScope, request_key: str) -> LedgerEntry | None: ...
-
-
-@dataclass(frozen=True, slots=True)
-class AttemptOutcome:
-    """What the caller may know about one invoke attempt."""
-
-    code: InvokeCode
-    detail: str | None
-    request_key: str | None = None
-    intent_fingerprint: str | None = None
-    reason: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class CommittedChange:
-    """One accepted mutation plan, without exposing handler internals."""
-
-    resource: str
-    key: str
-    version: int
-    changes: tuple[Assignment, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class ExecutionRecord:
-    """The authoritative outcome of one accepted execution, replayable from the ledger."""
-
-    execution_id: str
-    status: ExecutionStatus
-    action: DefinitionKey
-    requester: Principal
-    committed: tuple[CommittedChange, ...] = ()
-    children: tuple[DefinitionKey, ...] = ()
-    deduplicated: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class ActionResult:
-    """An attempt outcome plus an execution only when one was actually created."""
-
-    attempt: AttemptOutcome
-    execution: ExecutionRecord | None = None
-    writes: tuple[ApplyResult, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,8 +326,8 @@ class HandlerCtx:
         arguments = _child_arguments(entry, params, self._execution, self._principal)
         child = HandlerCtx(
             principal=self._principal,
-            reads=_defined_keys(self._execution.linked, declaration.reads),
-            writes=_declared_writes(self._execution.linked, declaration.writes),
+            reads=defined_keys(self._execution.linked, declaration.reads),
+            writes=declared_writes(self._execution.linked, declaration.writes),
             calls=tuple(
                 bound for bound in self._execution.bound.calls if bound.caller == target.callee
             ),
@@ -375,6 +354,7 @@ def invoke(
     parameters: Mapping[str, object],
     request_key: str | None = None,
     intent_fingerprint: str | None = None,
+    approval_expires_at: str | None = None,
 ) -> ActionResult:
     """Run one declared handler and its declared children, committing at most once."""
     execution: _Execution | None = None
@@ -382,37 +362,47 @@ def invoke(
     scope: RequestScope | None = None
     fingerprint: str | None = None
     try:
-        entry = _entry(linked, action, bound)
+        entry = linked_action(linked, action, bound)
         declaration = cast(type[Action], entry.definition.declaration)
         if declaration.permission not in principal.permissions:
             raise InvokeDenied("the requester lacks the action's invoke permission.")
-        if declaration.approval is not None or declaration.effects:
+        approval = declaration.approval
+        if declaration.effects:
             raise InvokeDenied(
-                "this declaration needs governance a synchronous invoke cannot honor."
+                "this declaration needs effect governance a synchronous invoke cannot honor."
             )
         if request_key is not None:
-            scope = _request_scope(principal, action)
+            scope = request_scope(principal, action)
             fingerprint = compute_intent_fingerprint(action, parameters)
-            if intent_fingerprint is not None and intent_fingerprint != fingerprint:
-                raise InvokeDenied(_KEY_MISUSE_DETAIL)
-            unit = provider.begin(_session(bound))
+            unit = provider.begin(bound_session(bound))
             stored = cast(LedgerUnitOfWork, unit).lookup(scope, request_key)
             if stored is not None:
-                if stored.intent_fingerprint != fingerprint:
+                pinned = compute_intent_fingerprint(
+                    DefinitionKey(action.identity, stored.action_version), parameters
+                )
+                if intent_fingerprint is not None and intent_fingerprint != pinned:
                     raise InvokeDenied(_KEY_MISUSE_DETAIL)
+                if stored.intent_fingerprint != pinned:
+                    raise InvokeDenied(_KEY_MISUSE_DETAIL)
+                fingerprint = pinned
                 replayed = _replay(stored)
                 if replayed is None:
                     raise InvokeDenied("the stored execution cannot be verified.")
-                _discard(unit)
+                discard_unit(unit)
                 return replayed
+            if intent_fingerprint is not None and intent_fingerprint != fingerprint:
+                raise InvokeDenied(_KEY_MISUSE_DETAIL)
+            if approval is not None:
+                discard_unit(unit)
+                unit = None
         arguments = _arguments(entry, action, parameters, provider, principal, grants)
         columns = {identity: tuple(spec.columns) for identity, spec in provider.resources.items()}
-        allowed_writes = _declared_writes(linked, declaration.writes)
-        _require_plan_writes(bound, allowed_writes)
+        allowed_writes = declared_writes(linked, declaration.writes)
+        require_writes(bound, allowed_writes)
         execution = _Execution(linked, bound, provider, grants, columns, [], [])
         ctx = HandlerCtx(
             principal=principal,
-            reads=_defined_keys(linked, declaration.reads),
+            reads=defined_keys(linked, declaration.reads),
             writes=allowed_writes,
             calls=bound.calls,
             delegations=bound.delegations,
@@ -421,25 +411,67 @@ def invoke(
         handler = cast(Callable[..., object], vars(declaration)["handler"])
         handler(declaration(), ctx, **arguments)
 
+        if approval is not None:
+            versions = tuple(
+                ObjectVersion(value.definition.identity, value.key, value.version)
+                for value in arguments.values()
+                if isinstance(value, ResolvedObject)
+            )
+            scopes = tuple(sorted({name for grant in grants.values() for name in grant.scopes}))
+            awaiting = build_awaiting(
+                approval=approval,
+                arguments=arguments,
+                canonical_input=cast(Mapping[str, object], canonicalize(dict(parameters))),
+                object_versions=versions,
+                linked=linked,
+                action=action,
+                principal=principal,
+                scopes=scopes,
+                expires_at=approval_expires_at,
+            )
+            if awaiting is not None:
+                if scope is None or request_key is None or fingerprint is None:
+                    raise InvokeDenied("an approval wait needs a scoped request key.")
+                existing = claim_awaiting_key(
+                    provider,
+                    bound_session(bound),
+                    scope,
+                    request_key,
+                    fingerprint,
+                    action.version,
+                    awaiting,
+                )
+                if existing is not None:
+                    return _stored_replay(existing, request_key, fingerprint)
+                intent = awaiting.material_intent
+                return ActionResult(
+                    AttemptOutcome("AWAITING_APPROVAL", None, request_key, fingerprint),
+                    ExecutionRecord(
+                        awaiting.execution_id,
+                        "AWAITING_APPROVAL",
+                        awaiting.action,
+                        awaiting.requester,
+                        (),
+                        intent.child_keys,
+                        True,
+                        awaiting.pinned_manifest,
+                        intent,
+                        awaiting.required_approval,
+                        awaiting.canonical_input,
+                    ),
+                )
         registrations = tuple(execution.registrations)
         if not registrations:
             raise InvokeDenied("a write-declaring action registered no mutation.")
         writes = _guarded(registrations, bound, provider, principal, grants)
+        changes = tuple(
+            CommittedChange(
+                item.target.definition.identity, item.target.key, item.target.version, item.changes
+            )
+            for item in registrations
+        )
         record = ExecutionRecord(
-            execution_id=uuid.uuid4().hex,
-            status="COMMITTED",
-            action=action,
-            requester=principal,
-            committed=tuple(
-                CommittedChange(
-                    item.target.definition.identity,
-                    item.target.key,
-                    item.target.version,
-                    item.changes,
-                )
-                for item in registrations
-            ),
-            children=tuple(execution.children),
+            uuid.uuid4().hex, "COMMITTED", action, principal, changes, tuple(execution.children)
         )
         ledger_entry: LedgerEntry | None = None
         if request_key is not None and scope is not None and fingerprint is not None:
@@ -453,16 +485,16 @@ def invoke(
                 encode_result(_stored_result(record)),
             )
         results = commit_guarded_writes(
-            provider, _session(bound), writes, entry=ledger_entry, unit=unit
+            provider, bound_session(bound), writes, entry=ledger_entry, unit=unit
         )
     except BusinessRejected as exc:
-        _discard(unit)
+        discard_unit(unit)
         return _rejected(action, principal, str(exc), _children(execution))
     except DuplicateRequest:
-        _discard(unit)
+        discard_unit(unit)
         return _duplicate_outcome(provider, scope, request_key, fingerprint)
     except (InvokeDenied, UnboundWriteAttempt, ValueError, PermissionError) as exc:
-        _discard(unit)
+        discard_unit(unit)
         detail = str(exc) if isinstance(exc, InvokeDenied) else _DENIED_DETAIL
         return _outcome(
             "DENIED",
@@ -472,12 +504,12 @@ def invoke(
             intent_fingerprint=fingerprint,
         )
     except (_Stale, StalePlan):
-        _discard(unit)
+        discard_unit(unit)
         return _outcome(
             "StalePlan", _STALE_DETAIL, request_key=request_key, intent_fingerprint=fingerprint
         )
     except (TransactionUnavailable, CommitOutcomeUnknown):
-        _discard(unit)
+        discard_unit(unit)
         return _outcome(
             "UNKNOWN", _UNAVAILABLE_DETAIL, request_key=request_key, intent_fingerprint=fingerprint
         )
@@ -487,127 +519,6 @@ def invoke(
         execution=record,
         writes=tuple(results),
     )
-
-
-def reconcile(
-    *,
-    provider: LedgerProvider,
-    principal: Principal,
-    action: DefinitionKey,
-    request_key: str,
-) -> ActionResult:
-    """Return a stored authoritative result only to a reader with record authority."""
-    if EXECUTION_READ_PERMISSION not in principal.permissions:
-        return _outcome("DENIED", "read authority for execution records is required.")
-    if not request_key.strip():
-        return _outcome("UNKNOWN", _UNKNOWN_DETAIL)
-    stored = provider.lookup(_request_scope(principal, action), request_key)
-    if stored is None:
-        return _outcome("UNKNOWN", _UNKNOWN_DETAIL)
-    replayed = _replay(stored)
-    if replayed is None:
-        return _outcome("UNKNOWN", _UNKNOWN_DETAIL)
-    return replayed
-
-
-def _request_scope(principal: Principal, action: DefinitionKey) -> RequestScope:
-    return RequestScope(principal.tenant, principal.identity, action.identity)
-
-
-def _discard(unit: UnitOfWork | None) -> None:
-    if unit is None:
-        return
-    try:
-        unit.rollback()
-    finally:
-        unit.close()
-
-
-def _duplicate_outcome(
-    provider: ScopedEngineProvider,
-    scope: RequestScope | None,
-    request_key: str | None,
-    fingerprint: str | None,
-) -> ActionResult:
-    if scope is not None and request_key is not None and fingerprint is not None:
-        stored = provider.lookup(scope, request_key)
-        if stored is not None and stored.intent_fingerprint == fingerprint:
-            replayed = _replay(stored)
-            if replayed is not None:
-                return replayed
-        return _outcome(
-            "DENIED",
-            _KEY_MISUSE_DETAIL,
-            reason="KEY_MISUSE",
-            request_key=request_key,
-            intent_fingerprint=fingerprint,
-        )
-    return _outcome("DENIED", _DENIED_DETAIL)
-
-
-def _stored_result(record: ExecutionRecord) -> StoredResult:
-    return StoredResult(
-        record.execution_id,
-        "COMMITTED",
-        record.action,
-        record.requester,
-        tuple(
-            StoredChange(
-                item.resource,
-                item.key,
-                item.version,
-                tuple((c.column, c.op, c.value) for c in item.changes),
-            )
-            for item in record.committed
-        ),
-        record.children,
-    )
-
-
-def _replay(stored: LedgerEntry) -> ActionResult | None:
-    result = decode_result(stored.payload)
-    if result is None:
-        return None
-    return ActionResult(
-        attempt=AttemptOutcome("COMMITTED", None, stored.request_key, stored.intent_fingerprint),
-        execution=ExecutionRecord(
-            result.execution_id,
-            "COMMITTED",
-            result.action,
-            result.requester,
-            tuple(
-                CommittedChange(
-                    item.resource,
-                    item.key,
-                    item.version,
-                    tuple(
-                        Assignment(column, cast(SetOp, op), value)
-                        for column, op, value in item.changes
-                    ),
-                )
-                for item in result.committed
-            ),
-            result.children,
-            deduplicated=True,
-        ),
-    )
-
-
-def _entry(
-    linked: LinkedDeclarations,
-    action: DefinitionKey,
-    bound: BoundAction,
-) -> LinkedDefinition:
-    if bound.action != action or bound.session is None:
-        raise InvokeDenied("the bound plan does not name this exact action and session.")
-    entry = linked.definitions.get(action.identity)
-    if (
-        entry is None
-        or entry.definition.version != action.version
-        or not issubclass(entry.definition.declaration, Action)
-    ):
-        raise InvokeDenied("no linked action exists at this exact identity and version.")
-    return entry
 
 
 def _arguments(
@@ -626,7 +537,7 @@ def _arguments(
         hint = entry.hints[name]
         value = parameters[name]
         if isinstance(hint, type) and issubclass(hint, ObjectRef):
-            expected = _ref_target(hint)
+            expected = ref_target(hint)
             if not is_issued_ref(value):
                 raise InvokeDenied(
                     "a typed ref parameter needs a ref issued by an authorized query."
@@ -662,7 +573,7 @@ def _child_arguments(
             if isinstance(value, ResolvedObject):
                 handle = cast(ResolvedObject[object], value)
                 value = handle.ref
-            expected = _ref_target(hint)
+            expected = ref_target(hint)
             if not is_issued_ref(value):
                 raise InvokeDenied("a typed child ref needs a ref issued by an authorized query.")
             typed = cast(VersionedRef[object], value)
@@ -678,15 +589,6 @@ def _child_arguments(
             raise InvokeDenied("a boolean is not an integer child parameter.")
         arguments[name] = value
     return arguments
-
-
-def _ref_target(hint: type[object]) -> DefinitionKey:
-    target = cast(object, getattr(hint, "target", None))
-    identity = getattr(target, "identity", None)
-    version = getattr(target, "version", None)
-    if not isinstance(identity, str) or not identity or not isinstance(version, str) or not version:
-        raise InvokeDenied("the declared ref target is not version-explicit.")
-    return DefinitionKey(identity, version)
 
 
 def _resolve_scoped(
@@ -711,45 +613,6 @@ def _resolved(row: QueryRow[object]) -> ResolvedObject[object]:
     return ResolvedObject(row.definition, row.key, row.instance_version, row.values, _SEAL)
 
 
-def _defined_keys(linked: LinkedDeclarations, raw: Sequence[object]) -> frozenset[DefinitionKey]:
-    keys: set[DefinitionKey] = set()
-    for value in raw:
-        identity = cast(object, getattr(value, "identity", value))
-        if not isinstance(identity, str) or not identity:
-            raise InvokeDenied("a declared read has no identity.")
-        item = linked.definitions.get(identity)
-        if item is None or item.definition.version is None:
-            raise InvokeDenied("a declared read is not in the linked graph.")
-        keys.add(DefinitionKey(identity, item.definition.version))
-    return frozenset(keys)
-
-
-def _declared_writes(linked: LinkedDeclarations, raw: Sequence[object]) -> frozenset[str]:
-    identities = {getattr(item, "identity", item) for item in raw}
-    return frozenset(
-        identity
-        for identity in (item.definition.identity for item in linked.all_definitions)
-        if identity is not None and identity in identities
-    )
-
-
-def _require_plan_writes(bound: BoundAction, allowed: frozenset[str]) -> None:
-    session = _session(bound)
-    writable = {item.identity for item in session.writes}
-    for bound_write in bound.writes:
-        if bound_write.resource.identity not in writable:
-            raise InvokeDenied("the bound session does not contain a declared write.")
-    for identity in allowed:
-        if identity not in writable:
-            raise InvokeDenied("a declared write has no enlistment in the bound session.")
-
-
-def _session(bound: BoundAction) -> SessionPlan:
-    if bound.session is None:
-        raise InvokeDenied("no session plan is bound to this action.")
-    return bound.session
-
-
 def _guarded(
     registrations: tuple[_Registration, ...],
     bound: BoundAction,
@@ -757,7 +620,7 @@ def _guarded(
     principal: Principal,
     grants: Mapping[DefinitionKey, ReadGrant],
 ) -> tuple[GuardedWrite, ...]:
-    session = _session(bound)
+    session = bound_session(bound)
     for registration in registrations:
         target = registration.target
         ref = target.ref
@@ -788,29 +651,8 @@ def _rejected(
     detail: str,
     children: tuple[DefinitionKey, ...] = (),
 ) -> ActionResult:
-    return ActionResult(
-        attempt=AttemptOutcome("REJECTED", detail),
-        execution=ExecutionRecord(
-            execution_id=uuid.uuid4().hex,
-            status="REJECTED",
-            action=action,
-            requester=principal,
-            children=children,
-        ),
-    )
-
-
-def _outcome(
-    code: InvokeCode,
-    detail: str | None,
-    *,
-    reason: str | None = None,
-    request_key: str | None = None,
-    intent_fingerprint: str | None = None,
-) -> ActionResult:
-    return ActionResult(
-        attempt=AttemptOutcome(code, detail, request_key, intent_fingerprint, reason)
-    )
+    record = ExecutionRecord(uuid.uuid4().hex, "REJECTED", action, principal, (), children)
+    return ActionResult(AttemptOutcome("REJECTED", detail), record)
 
 
 __all__ = [
