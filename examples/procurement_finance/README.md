@@ -9,7 +9,8 @@ Ví dụ chạy được trên API công khai thật của `codology`: khai báo
 - `procurement.py` — `PurchaseOrder`, `OrderApprovedPayload`, `NotifyWarehouseOrderApproved`, `ApprovePurchaseOrder`, `Procurement`. Tham chiếu Finance bằng identity đã khai báo (`Link["finance.budget", ...]`, `calls = ("finance.reserve_budget",)`) nên module này không import Finance lúc chạy.
 - `model.py` — ghép hai `ModuleDeclarations` và chạy `load`, `link`, `snapshot`.
 - `scenarios.py` — sáu ca lỗi tĩnh; mỗi hàm trả về error thật để script in ra và test assert lại.
-- `__main__.py` — entry point của ví dụ.
+- `__main__.py` — entry point của ví dụ tĩnh.
+- `runtime.py` — contract nấc 2 dùng bởi ví dụ thực thi [`examples/atomic_approval/`](../atomic_approval/README.md) và các test invoke/child; không tham gia đường Load/Link/Snapshot tĩnh ở trên.
 
 ## Chạy ví dụ
 

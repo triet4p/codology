@@ -7,6 +7,7 @@ import threading
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -23,7 +24,7 @@ from codology import (
     load,
     snapshot,
 )
-from codology.adapter import CurrencyMismatch, ResourceBinding, SQLiteProvider
+from codology.adapter import CurrencyMismatch, ResourceBinding, SQLiteProvider, SQLiteUnitOfWork
 from codology.declarations import Action, CommitRequirement, Module, ObjectRef, ObjectType
 from codology.money import MinorMoney
 from codology.ports import (
@@ -273,6 +274,43 @@ def test_two_writes_share_one_open_transaction(tmp_path: Path) -> None:
     assert orders["PO-A"] == ("APPROVED", 40_000, 2)
 
 
+def test_unit_of_work_closes_its_connection_after_commit(tmp_path: Path) -> None:
+    path = _database(tmp_path)
+    unit = _provider(path).begin(_plan())
+    assert isinstance(unit, SQLiteUnitOfWork)
+    connection = cast(sqlite3.Connection, vars(unit)["_connection"])
+
+    unit.commit()
+    unit.close()
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        connection.execute("SELECT 1")
+
+
+def test_unit_of_work_closes_its_connection_after_rollback(tmp_path: Path) -> None:
+    path = _database(tmp_path)
+    unit = _provider(path).begin(_plan())
+    assert isinstance(unit, SQLiteUnitOfWork)
+    connection = cast(sqlite3.Connection, vars(unit)["_connection"])
+    before = _state(path)
+    unit.apply(_budget_write())
+
+    unit.rollback()
+    unit.close()
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        connection.execute("SELECT 1")
+    assert _state(path) == before
+
+
+def test_unit_of_work_close_is_idempotent_after_commit(tmp_path: Path) -> None:
+    path = _database(tmp_path)
+    unit = _provider(path).begin(_plan())
+    unit.commit()
+    unit.close()
+    unit.close()
+
+
 class _SecondApplyFails:
     """Test-local wrapper: lose the response after the first write."""
 
@@ -373,7 +411,7 @@ def test_controlled_two_connection_budget_contention(tmp_path: Path) -> None:
     before = _state(path)
     both_read = threading.Barrier(2)
     loser_turn = threading.Event()
-    outcomes: dict[str, object] = {}
+    outcomes: dict[str, tuple[ApplyResult, ...] | BaseException] = {}
 
     def run(order_id: str) -> None:
         observed = _state(path)[0]

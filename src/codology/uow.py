@@ -49,8 +49,11 @@ def commit_guarded_writes(
             ledger.record(entry)
         active.commit()
         return results
-    except BaseException:
-        active.rollback()
+    except BaseException as exc:
+        try:
+            active.rollback()
+        except BaseException as rollback_error:
+            exc.add_note(f"rollback after a failed unit also failed: {rollback_error!r}")
         raise
     finally:
         active.close()

@@ -32,18 +32,18 @@ from codology.ledger import (
     decode_result,
     encode_result,
 )
-from codology.ledger import (
-    intent_fingerprint as compute_intent_fingerprint,
-)
+from codology.ledger import intent_fingerprint as compute_intent_fingerprint
 from codology.linking import LinkedDeclarations, LinkedDefinition
 from codology.money import MinorMoney
 from codology.ports import (
     ApplyResult,
     Assignment,
+    CommitOutcomeUnknown,
     Condition,
     GuardedWrite,
     SetOp,
     StalePlan,
+    TransactionUnavailable,
     UnitOfWork,
 )
 from codology.query import (
@@ -64,6 +64,7 @@ _DENIED_DETAIL = "invoke request was refused by the engine gate."
 _STALE_DETAIL = "the resolved world changed; re-read and recompute before retrying."
 _KEY_MISUSE_DETAIL = "the request key and intent do not match the stored result."
 _UNKNOWN_DETAIL = "no authoritative result is available for this request."
+_UNAVAILABLE_DETAIL = "the bound transaction did not complete; no commit was confirmed."
 _SEAL = object()
 
 
@@ -318,10 +319,7 @@ class HandlerCtx:
         """Dispatch one declared child Action at its linked revision under narrowed authority."""
         if not isinstance(action, str):
             raise InvokeDenied("a call names an action identity.")
-        target = next(
-            (bound for bound in self._calls if bound.callee.identity == action),
-            None,
-        )
+        target = next((bound for bound in self._calls if bound.callee.identity == action), None)
         if target is None:
             raise InvokeDenied("the call is not declared by this action.")
         delegation = next(
@@ -405,6 +403,7 @@ def invoke(
                 replayed = _replay(stored)
                 if replayed is None:
                     raise InvokeDenied("the stored execution cannot be verified.")
+                _discard(unit)
                 return replayed
         arguments = _arguments(entry, action, parameters, provider, principal, grants)
         columns = {identity: tuple(spec.columns) for identity, spec in provider.resources.items()}
@@ -476,6 +475,11 @@ def invoke(
         _discard(unit)
         return _outcome(
             "StalePlan", _STALE_DETAIL, request_key=request_key, intent_fingerprint=fingerprint
+        )
+    except (TransactionUnavailable, CommitOutcomeUnknown):
+        _discard(unit)
+        return _outcome(
+            "UNKNOWN", _UNAVAILABLE_DETAIL, request_key=request_key, intent_fingerprint=fingerprint
         )
 
     return ActionResult(
@@ -704,13 +708,7 @@ def _resolve_scoped(
 
 
 def _resolved(row: QueryRow[object]) -> ResolvedObject[object]:
-    return ResolvedObject(
-        row.definition,
-        row.key,
-        row.instance_version,
-        row.values,
-        _SEAL,
-    )
+    return ResolvedObject(row.definition, row.key, row.instance_version, row.values, _SEAL)
 
 
 def _defined_keys(linked: LinkedDeclarations, raw: Sequence[object]) -> frozenset[DefinitionKey]:

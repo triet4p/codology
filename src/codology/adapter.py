@@ -2,22 +2,26 @@
 
 from __future__ import annotations
 
+import math
 import re
 import sqlite3
 from collections.abc import Mapping, Sequence
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 from codology.binding import SessionPlan
 from codology.ledger import DuplicateRequest, LedgerEntry, RequestScope
 from codology.money import MinorMoney
 from codology.ports import (
     ApplyResult,
+    CommitOutcomeUnknown,
     CompareOp,
     GuardedWrite,
     SessionMismatch,
     StalePlan,
+    TransactionUnavailable,
     UnitOfWork,
 )
 from codology.query import (
@@ -200,14 +204,15 @@ class SQLiteUnitOfWork:
         self._transaction = transaction
         self._resources = resources
         self._ledger_table = ledger_table
-        self._closed = False
+        self._transaction_ended = False
+        self._connection_closed = False
 
     @property
     def transaction(self) -> str:
         return self._transaction
 
     def _require_open(self) -> None:
-        if self._closed:
+        if self._transaction_ended or self._connection_closed:
             raise RuntimeError("the unit of work is closed.")
 
     def apply(self, write: GuardedWrite) -> ApplyResult:
@@ -244,7 +249,10 @@ class SQLiteUnitOfWork:
         statement = (
             f"UPDATE {binding.table} SET {', '.join(assignments)} WHERE {' AND '.join(predicates)}"
         )
-        cursor = self._connection.execute(statement, parameters)
+        try:
+            cursor = self._connection.execute(statement, parameters)
+        except sqlite3.OperationalError as exc:
+            raise TransactionUnavailable(f"guarded write failed before commit: {exc}") from exc
         result = ApplyResult(
             resource=write.resource,
             key=write.key,
@@ -268,9 +276,12 @@ class SQLiteUnitOfWork:
             f"SELECT {', '.join(_LEDGER_SELECT)} FROM {self._ledger_table} "
             "WHERE tenant = ? AND principal = ? AND action = ? AND request_key = ?"
         )
-        found = self._connection.execute(
-            statement, (scope.tenant, scope.principal, scope.action, request_key)
-        ).fetchone()
+        try:
+            found = self._connection.execute(
+                statement, (scope.tenant, scope.principal, scope.action, request_key)
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            raise TransactionUnavailable(f"ledger lookup failed before commit: {exc}") from exc
         return None if found is None else _stored_entry(scope, request_key, found)
 
     def record(self, entry: LedgerEntry) -> None:
@@ -297,24 +308,36 @@ class SQLiteUnitOfWork:
             raise DuplicateRequest(
                 f"request key {entry.request_key!r} is already claimed."
             ) from exc
+        except sqlite3.OperationalError as exc:
+            raise TransactionUnavailable(f"ledger claim failed before commit: {exc}") from exc
 
     def commit(self) -> None:
         self._require_open()
-        self._connection.commit()
-        self._closed = True
+        try:
+            self._connection.commit()
+        except sqlite3.OperationalError as exc:
+            raise CommitOutcomeUnknown(
+                f"the commit did not report a definite outcome; reconcile before retrying: {exc}"
+            ) from exc
+        self._transaction_ended = True
 
     def rollback(self) -> None:
-        if self._closed:
+        if self._transaction_ended or self._connection_closed:
             return
-        if self._connection.in_transaction:
-            self._connection.rollback()
-        self._closed = True
+        try:
+            if self._connection.in_transaction:
+                self._connection.rollback()
+        finally:
+            self._transaction_ended = True
 
     def close(self) -> None:
-        if self._closed:
+        if self._connection_closed:
             return
-        self._connection.close()
-        self._closed = True
+        try:
+            self._connection.close()
+        finally:
+            self._connection_closed = True
+            self._transaction_ended = True
 
 
 class SQLiteProvider:
@@ -326,10 +349,17 @@ class SQLiteProvider:
         session: str,
         resources: Sequence[ResourceBinding],
         ledger_table: str = "request_ledger",
+        timeout: float = 10.0,
     ) -> None:
         self.database = Path(database)
         self.session = _require_text(session, "session")
         self.ledger_table = _identifier(ledger_table, "ledger_table")
+        timeout_value = cast(object, timeout)
+        if isinstance(timeout_value, bool) or not isinstance(timeout_value, int | float):
+            raise TypeError("timeout must be a number of seconds.")
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be positive and finite.")
+        self.timeout = float(timeout)
         bindings = tuple(resources)
         self.resources: dict[str, ResourceBinding] = {}
         for binding in bindings:
@@ -347,10 +377,20 @@ class SQLiteProvider:
         for resource in plan.writes:
             if resource.identity not in self.resources:
                 raise UnknownResource(f"bound write {resource.identity!r} has no adapter mapping.")
-        connection = sqlite3.connect(self.database, timeout=10.0, isolation_level=None)
         try:
-            connection.execute("PRAGMA busy_timeout = 10000")
+            connection = sqlite3.connect(self.database, timeout=self.timeout, isolation_level=None)
+        except sqlite3.OperationalError as exc:
+            raise TransactionUnavailable(
+                f"could not open the bound session {self.session!r}: {exc}"
+            ) from exc
+        try:
+            connection.execute(f"PRAGMA busy_timeout = {round(self.timeout * 1000)}")
             connection.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            connection.close()
+            raise TransactionUnavailable(
+                f"could not start the bound transaction {self.session!r}: {exc}"
+            ) from exc
         except BaseException:
             connection.close()
             raise
@@ -364,7 +404,9 @@ class SQLiteProvider:
             "WHERE tenant = ? AND principal = ? AND action = ? AND request_key = ?"
         )
         parameters = (scope.tenant, scope.principal, scope.action, request_key)
-        with closing(sqlite3.connect(self.database, timeout=10.0, isolation_level=None)) as conn:
+        with closing(
+            sqlite3.connect(self.database, timeout=self.timeout, isolation_level=None)
+        ) as conn:
             conn.execute("PRAGMA query_only = ON")
             found = conn.execute(statement, parameters).fetchone()
         return None if found is None else _stored_entry(scope, request_key, found)
@@ -448,7 +490,9 @@ class SQLiteProvider:
         )
 
         count: int | None = None
-        with closing(sqlite3.connect(self.database, timeout=10.0, isolation_level=None)) as conn:
+        with closing(
+            sqlite3.connect(self.database, timeout=self.timeout, isolation_level=None)
+        ) as conn:
             conn.execute("PRAGMA query_only = ON")
             if request.count_requested:
                 found = conn.execute(
@@ -506,7 +550,9 @@ class SQLiteProvider:
             f"AND {key_column} = ?"
         )
         parameters = (grant.tenant, *grant.scopes, ref.key)
-        with closing(sqlite3.connect(self.database, timeout=10.0, isolation_level=None)) as conn:
+        with closing(
+            sqlite3.connect(self.database, timeout=self.timeout, isolation_level=None)
+        ) as conn:
             conn.execute("PRAGMA query_only = ON")
             found = conn.execute(statement, parameters).fetchone()
         if found is None:

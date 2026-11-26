@@ -11,8 +11,9 @@ Repository đang ở Sprint 4 — Lát cắt thực thi nguyên tử. Phần đ�
 - `codology.declarations` cung cấp `Action`, `Function`, `Effect` và predicate approval cấu trúc: `params`, `reads`/`writes`/`calls`, `permission`, `commitRequirement`, `approval` và `effects` được đóng băng lúc khai báo; không chạy handler hay đánh giá predicate.
 - Load, Link và `snapshot()` đã được triển khai; snapshot công bố graph đã link dưới dạng bất biến, tra cứu tường minh theo identity/version.
 - Ví dụ Procurement/Finance chạy được trên API thật (`examples/procurement_finance/`) cùng kiểm thử tích hợp và kiểm tra typing cho cả đường thành công lẫn lỗi tĩnh.
+- Ví dụ thực thi (`examples/atomic_approval/`) chạy đường consumer `query → row.as_ref() → invoke` nấc 2 trên adapter SQLite thật: commit đơn và giữ ngân sách trong một transaction, replay theo `request_key`, cùng các nhánh read/invoke denial và split binding. Kiểm thử tích hợp đọc lại dữ liệu bằng connection độc lập.
 - `bind_action()` kiểm tra deployment plan cho action `ATOMIC`: capability của provider, write set bắc cầu qua `calls`, một session enlist chung và mapping ủy quyền không rộng hơn contract; không gọi handler và không mở transaction.
-- `codology.adapter` mở đúng một transaction SQLite vật lý cho mọi write đã bind; `commit_guarded_writes()` là biên commit do engine/port sở hữu, rollback sạch trước commit và chỉ coi `rowcount == 1` là thành công. Tiền được biểu diễn bằng số nguyên đơn vị nhỏ (`MinorMoney`) với một currency cố định, không FX.
+- `codology.adapter` mở đúng một transaction SQLite vật lý cho mọi write đã bind; `commit_guarded_writes()` là biên commit do engine/port sở hữu, rollback sạch trước commit và chỉ coi `rowcount == 1` là thành công. Mỗi unit đóng connection khi transaction kết thúc (sau commit, rollback hoặc `close()`), và `SQLiteProvider` nhận `timeout` giây cho việc acquire lock. Tiền được biểu diễn bằng số nguyên đơn vị nhỏ (`MinorMoney`) với một currency cố định, không FX.
 - Cửa `engine.query` (hàm `query()`) authorize principal/grant trước khi đọc, chỉ nhận predicate có pushdown đã kiểm chứng, áp tenant/scope ở adapter trước phân trang/count và phát hành ref có type/version từ row. `invoke()` chạy một handler đã khai báo sau khi kiểm quyền ghi live, resolve lại ref theo scope hiện tại, cấp `HandlerCtx` hẹp, revalidate rồi commit một transaction duy nhất cùng bản ghi ledger; publish artifact **chưa được triển khai**.
 
 ## Yêu cầu
@@ -33,6 +34,7 @@ Lệnh trên tạo `.venv`, cài package ở chế độ editable và cài nhóm
 ```bash
 uv run python -c "import codology; print(codology.__version__)"
 uv run python -m examples.procurement_finance
+uv run python -m examples.atomic_approval
 uv run pytest
 uv run pyright
 uv run ruff check .
@@ -67,8 +69,13 @@ examples/procurement_finance/
   procurement.py     # PurchaseOrder, effect, ApprovePurchaseOrder, Procurement
   model.py           # ghép nhóm, load/link/snapshot
   scenarios.py       # sáu ca lỗi tĩnh có thể chạy
-  __main__.py        # entry point của ví dụ
+  __main__.py        # entry point của ví dụ tĩnh
   runtime.py         # contract nấc 2 riêng cho child action, không approval/effect
+examples/atomic_approval/
+  database.py        # schema SQLite và dữ liệu seed hai tenant
+  wiring.py          # graph, deployment plan, adapter, principal và read grant
+  consumer.py        # query -> row.as_ref() -> invoke, không chép luật nghiệp vụ
+  __main__.py        # entry point chạy consumer trên DB thật
 tests/
   test_annotations.py
   test_behavior.py
@@ -80,6 +87,7 @@ tests/
   test_loading.py
   test_package.py
   test_procurement_finance_integration.py
+  test_atomic_approval_example.py # commit, denial, split binding, rollback, race, replay
   test_snapshot.py
   test_invoke.py     # DENIED/REJECTED/StalePlan, ref scope, ctx hẹp, commit/rollback
   test_child_action.py # child đã link, ủy quyền, scope, rollback, một transaction
@@ -412,6 +420,8 @@ Handler chỉ nhận `HandlerCtx`: `principal` chỉ đọc, `reads`/`writes`/`c
 
 `ActionResult` gồm `attempt` (`code`: `COMMITTED`, `DENIED`, `REJECTED` hoặc `StalePlan`), `execution` và kết quả các write. `DENIED` và `StalePlan` không tạo execution record và không đổi DB; `REJECTED` do `ctx.require` là outcome nghiệp vụ có record terminal; `COMMITTED` mang record kèm các mutation đã chấp nhận và danh sách child revision đã chạy. `ctx.call` chỉ dispatch khi đích nằm trong `calls`, có delegation grant đúng quyền của requester và tồn tại ở đúng revision đã link; gọi ngoài khai báo fail closed. Sổ request/result bền vững, replay theo `request_key` và effect vẫn nằm ngoài phạm vi cửa này.
 
+Lỗi hạ tầng ở cửa giao dịch — provider không mở đúng session đã bind, `BEGIN IMMEDIATE` không lấy được lock trong `timeout`, hay commit không xác nhận được — trả `attempt.code = "UNKNOWN"` với `execution = None` và không có write result. Port phân biệt `TransactionUnavailable` (không mở/dùng được transaction, chưa commit) với `CommitOutcomeUnknown` (đã thử commit nhưng không rõ kết quả); engine không gộp chúng vào `DENIED`/`REJECTED`/`StalePlan` và không tự nhận đã rollback. Caller phải `reconcile` hoặc lookup ledger trước khi retry cùng `request_key`; exception không thuộc lớp hạ tầng này vẫn propagate.
+
 ## Child Action qua ủy quyền thu hẹp
 
 `ctx.call("finance.reserve_budget", ...)` chỉ dispatch tới Action đã khai báo trong `calls` và đã link ở đúng identity/version. Engine kiểm delegation grant của requester, quyền live của child (`budget.reserve`) và resolve lại ref qua grant hiện tại; child nhận `HandlerCtx` riêng với `reads`/`writes` của chính nó nhưng dùng chung registration list, nên mọi write của cha và con nằm trong một `commit_guarded_writes()` duy nhất. Child `REJECTED` hoặc `DENIED` làm toàn bộ execution không commit; write trực tiếp từ Procurement vào `Budget` và call không khai báo đều fail closed.
@@ -452,6 +462,20 @@ Sau khi mất phản hồi, `reconcile(provider, principal, action, request_key)
 
 `tests/test_request_ledger.py` kiểm một transaction cho ledger và hai write, rollback sạch, replay sau mất phản hồi không chạy handler lần hai, race cùng key, intent lệch, tách biệt scope và quyền đọc/ghi của bản ghi.
 
+## Ví dụ thực thi query → ref → invoke
+
+`examples/atomic_approval/` bàn giao đúng đường consumer trên adapter thật:
+
+```bash
+uv run python -m examples.atomic_approval
+```
+
+Ví dụ tạo một file SQLite mới, đọc đơn `PENDING_APPROVAL` qua `query`, lấy `VersionedRef[PurchaseOrder]` bằng `row.as_ref()`, rồi gọi `invoke` cho `ApprovePurchaseOrder@1.1.0`. Nó dùng contract nấc 2 trong `examples/procurement_finance/runtime.py`, không chạy declaration nấc 3. Handler của Procurement và Finance giữ toàn bộ luật nghiệp vụ; phần consumer chỉ có `query`, `as_ref` và `invoke`, không tự kiểm quyền, không tự tính ngân sách và không SQL.
+
+Kết quả in ra gồm `COMMITTED` với hai write cùng một transaction id, replay cùng `request_key` với `deduplicated=True` và không giữ transaction sau replay, `reconcile` qua connection mới, và các nhánh `ReadDenied`, `UnsupportedSecureQuery`, invoke `DENIED` và `NoSharedTransaction`. Mọi kỳ vọng được assert, nên script thoát khác 0 nếu hành vi đổi.
+
+`tests/test_atomic_approval_example.py` chạy chính các hàm consumer này rồi đọc lại DB bằng connection độc lập cho sáu nhóm: commit, read/invoke denial, split binding, rollback sau write đầu, hai đơn tranh một budget và replay sau mất phản hồi. Cách chạy, tập query được hỗ trợ và non-claims nằm ở [`examples/atomic_approval/README.md`](examples/atomic_approval/README.md).
+
 ## Ví dụ Procurement/Finance
 
 `examples/procurement_finance/` là ví dụ chạy được trên chính API công khai ở trên: hai module Procurement và Finance, `ApprovePurchaseOrder` gọi `finance.reserve_budget`, kèm approval và effect metadata. Chạy từ gốc repo:
@@ -462,7 +486,7 @@ uv run python -m examples.procurement_finance
 
 Ví dụ in đường Load → Link → Snapshot rồi sáu lỗi tĩnh: `DuplicateIdentity` (Load), `NotExported`, `UnresolvedReference`, `ObjectRefMismatch`, `HandlerMismatch` (Link) và `UnsupportedApprovalExpression` (declaration). `tests/test_procurement_finance_integration.py` kiểm tra lại toàn bộ đường đi và output của entry point; `tests/typing/valid_api.py` ghim kiểu công khai, còn `tests/typing/invalid_api.py` đảm bảo Pyright vẫn bắt các lỗi kiểu có chủ đích.
 
-Không cần backend: handler chỉ là metadata và không được gọi. Hướng dẫn chạy, lỗi và non-claims chi tiết nằm ở [`examples/procurement_finance/README.md`](examples/procurement_finance/README.md).
+Không cần backend: handler chỉ là metadata và không được gọi. Declaration nấc 2 trong `runtime.py` không thuộc đường tĩnh này; nó được dùng bởi ví dụ thực thi `examples/atomic_approval/` và các test invoke/child. Hướng dẫn chạy, lỗi và non-claims chi tiết nằm ở [`examples/procurement_finance/README.md`](examples/procurement_finance/README.md).
 
 ## Quyết định đã chốt
 
@@ -474,14 +498,15 @@ Không cần backend: handler chỉ là metadata và không được gọi. Hư�
 - **Invoke một handler:** quyền ghi được kiểm live ở cửa engine, ref chỉ có giá trị khi resolve lại dưới grant hiện tại; `ctx.require` tạo `REJECTED`, xung đột version/guard tạo `StalePlan`, lỗi cửa tạo `DENIED` mà không tạo execution. Commit là quyết định của engine sau revalidate, không phải của handler.
 - **Child action đã link:** `calls` và delegation grant được bind trước runtime; `ctx.call` chạy handler của đúng revision đã link với context thu hẹn theo `reads`/`writes` của child, dùng chung một UoW và một transaction. Child `REJECTED`/`DENIED` hủy toàn bộ execution; service identity và ref tự dựng không thay được requester.
 - **Sổ yêu cầu bền vững:** scope key là `tenant / requester / action identity` (ổn định qua rollout version); dấu vân tay intent do engine recompute từ dữ liệu đã canonicalize, không phải digest handler. Key, intent và kết quả `COMMITTED` được ghi trong cùng transaction với mọi business write; replay trả kết quả cũ, còn tra cứu cần quyền đọc execution record.
+- **Consumer mẫu trên adapter thật:** `examples/atomic_approval/` giữ phần caller chỉ ở `query`, `row.as_ref()` và `invoke`; quyền, ngân sách và write nằm trong declaration/handler và engine. Split binding nấc 2 (hai file cùng SQLite) vẫn bị từ chối trước runtime, không hạ xuống saga.
 - Chi tiết và hệ quả cho các task sau: [`docs/official/design/implementation-baseline.md`](docs/official/design/implementation-baseline.md).
 
 ## Giới hạn
 
-- Đây vẫn là lớp mô hình tĩnh, deployment binding plan-check, adapter transaction có guarded write, cửa đọc có policy, cửa ghi `invoke()` với child đã link và sổ yêu cầu/kết quả bền vững. Chưa có publish artifact, approval/effect hay effect delivery.
+- Đây vẫn là lớp mô hình tĩnh, deployment binding plan-check, adapter transaction có guarded write, cửa đọc có policy, cửa ghi `invoke()` với child đã link và sổ yêu cầu/kết quả bền vững. `examples/atomic_approval/` chỉ là consumer mẫu trên SQLite một file; chưa có publish artifact, approval/effect hay effect delivery.
 - Load đã thu thập definition và kiểm tra identity/field; Link đã resolve reference, kiểm tra export/kind và chữ ký handler; snapshot đã công bố graph bất biến với lookup tường minh; `bind_action()` đã kiểm tra capability, write set và enlistment plan trên snapshot. Adapter transaction thật đã có; registry bền vững và publish artifact thuộc các task kế tiếp.
 - Predicate approval chỉ được lưu dạng cấu trúc; chưa có đánh giá ngưỡng, callback duyệt hay giao effect. `Function` dùng cùng quy ước `handler(self, ctx, ...)` với `Action` theo implementation baseline.
-- Bằng chứng invoke chỉ phủ handler đơn, một child đã link và sổ yêu cầu/kết quả trên adapter SQLite đã bind: từ chối quyền/scope/type/ref cũ, `REJECTED`, guard stale, ghi ngoài declaration, child sai revision/quyền/scope, key trùng intent khác, race cùng key và replay sau mất phản hồi. Không có tuyên bố về publish artifact, approval/effect, PostgreSQL/ERP, mọi lịch trình interleaving hay sandbox handler trong-process.
+- Bằng chứng invoke chỉ phủ handler đơn, một child đã link và sổ yêu cầu/kết quả trên adapter SQLite đã bind: từ chối quyền/scope/type/ref cũ, `REJECTED`, guard stale, ghi ngoài declaration, child sai revision/quyền/scope, key trùng intent khác, race cùng key và hai đơn tranh một budget, split binding và replay sau mất phản hồi. Không có tuyên bố về publish artifact, approval/effect, PostgreSQL/ERP, mọi lịch trình interleaving hay sandbox handler trong-process.
 - Static validation không phát hiện truy cập ẩn trong thân handler (import lén, `getattr` động, đọc file/socket). Binding chỉ kiểm tra mapping khai báo; nó không phát hiện host code tự mở connection hoặc dùng credential ambient ngoài plan và không sandbox handler. Đó là rủi ro đã ghi nhận, xử lý bằng review và test.
 
 ## Tài liệu

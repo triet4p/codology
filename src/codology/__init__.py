@@ -68,11 +68,13 @@ from codology.money import MinorMoney
 from codology.ports import (
     ApplyResult,
     Assignment,
+    CommitOutcomeUnknown,
     Condition,
     GuardedWrite,
     SessionMismatch,
     StalePlan,
     TransactionProvider,
+    TransactionUnavailable,
     UnitOfWork,
 )
 from codology.query import (
@@ -132,6 +134,7 @@ __all__ = [
     "Capability",
     "authorize_read",
     "is_issued_ref",
+    "CommitOutcomeUnknown",
     "ComparisonExpr",
     "Condition",
     "DefinitionKey",
@@ -172,6 +175,7 @@ __all__ = [
     "SnapshotEntry",
     "StalePlan",
     "TransactionProvider",
+    "TransactionUnavailable",
     "UnboundWrite",
     "UnboundWriteAttempt",
     "UndeclaredCall",

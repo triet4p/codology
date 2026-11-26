@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
 from codology.binding import SessionPlan
 
@@ -61,7 +61,8 @@ class GuardedWrite:
     def __post_init__(self) -> None:
         _require_text(self.resource, "GuardedWrite.resource")
         _require_text(self.key, "GuardedWrite.key")
-        if isinstance(self.expected_version, bool) or not isinstance(self.expected_version, int):
+        expected_version = cast(object, self.expected_version)
+        if isinstance(expected_version, bool) or not isinstance(expected_version, int):
             raise TypeError("GuardedWrite.expected_version must be an integer.")
         if self.expected_version < 0:
             raise ValueError("GuardedWrite.expected_version cannot be negative.")
@@ -105,7 +106,24 @@ class StalePlan(Exception):
         self.transaction = transaction
 
 
-class SessionMismatch(Exception):
+class TransactionUnavailable(Exception):
+    """The bound transaction could not be opened or used before a commit attempt.
+
+    Raised when the physical session is missing, locked by another writer, or
+    otherwise unable to take the work. No commit was attempted, so nothing can
+    have become durable through this unit.
+    """
+
+
+class CommitOutcomeUnknown(Exception):
+    """A commit was attempted but did not report a definite outcome.
+
+    The writes may or may not be durable. A caller must reconcile instead of
+    assuming a rollback or retrying blindly.
+    """
+
+
+class SessionMismatch(TransactionUnavailable):
     """A bound plan names a physical session the provider did not open."""
 
 
