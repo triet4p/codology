@@ -4,7 +4,7 @@ Codology (Ontology as Code) là framework khai báo thực thể, quan hệ và 
 
 ## Trạng thái
 
-Sprint 4 đã hoàn tất với lát cắt thực thi nguyên tử đồng bộ. [Sprint 5](docs/sprint-plans/sprint-5.md) đang triển khai từng phần: manifest ghim revision, trạng thái chờ ở cửa `invoke`, cửa quyết định duyệt, resume, ghi outbox cùng transaction và relay local đã có; phần consumer mẫu cuối cùng vẫn đang triển khai. Các phần đã có:
+Sprint 4 đã hoàn tất với lát cắt thực thi nguyên tử đồng bộ. [Sprint 5](docs/sprint-plans/sprint-5.md) đã phủ manifest ghim revision, trạng thái chờ ở cửa `invoke`, cửa quyết định duyệt, resume, ghi outbox cùng transaction, relay local và consumer mẫu nấc 3 chạy trên SQLite thật. Các phần đã có:
 
 
 - `codology` import được từ môi trường sạch, không cần database, credential hay backend SDK.
@@ -22,6 +22,7 @@ Sprint 4 đã hoàn tất với lát cắt thực thi nguyên tử đồng bộ.
 
 - Ví dụ Procurement/Finance chạy được trên API thật (`examples/procurement_finance/`) cùng kiểm thử tích hợp và kiểm tra typing cho cả đường thành công lẫn lỗi tĩnh.
 - Ví dụ thực thi (`examples/atomic_approval/`) chạy đường consumer `query → row.as_ref() → invoke` nấc 2 trên adapter SQLite thật: commit đơn và giữ ngân sách trong một transaction, replay theo `request_key`, cùng các nhánh read/invoke denial và split binding. Kiểm thử tích hợp đọc lại dữ liệu bằng connection độc lập.
+- Ví dụ thực thi nấc 3 (`examples/conditional_approval/`) chạy đường `query → ref → invoke → approve/reject → resume → relay` trên adapter SQLite thật: ngưỡng chờ, replay ghim revision sau restart, callback bị từ chối/trùng, duyệt lại, tranh ngân sách, mất ack và relay lỗi; đối chiếu order/budget/ledger/outbox bằng connection độc lập.
 - `bind_action()` kiểm tra deployment plan cho action `ATOMIC`: capability của provider, write set bắc cầu qua `calls`, một session enlist chung và mapping ủy quyền không rộng hơn contract; không gọi handler và không mở transaction.
 - `codology.adapter` mở đúng một transaction SQLite vật lý cho mọi write đã bind; `commit_guarded_writes()` là biên commit do engine/port sở hữu, rollback sạch trước commit và chỉ coi `rowcount == 1` là thành công. Mỗi unit đóng connection khi transaction kết thúc (sau commit, rollback hoặc `close()`), và `SQLiteProvider` nhận `timeout` giây cho việc acquire lock. Tiền được biểu diễn bằng số nguyên đơn vị nhỏ (`MinorMoney`) với một currency cố định, không FX.
 - Cửa `engine.query` (hàm `query()`) authorize principal/grant trước khi đọc, chỉ nhận predicate có pushdown đã kiểm chứng, áp tenant/scope ở adapter trước phân trang/count và phát hành ref có type/version từ row. `invoke()` chạy một handler đã khai báo sau khi kiểm quyền ghi live, resolve lại ref theo scope hiện tại, cấp `HandlerCtx` hẹp, revalidate rồi commit một transaction duy nhất cùng bản ghi ledger; publish artifact **chưa được triển khai**.
@@ -45,6 +46,7 @@ Lệnh trên tạo `.venv`, cài package ở chế độ editable và cài nhóm
 uv run python -c "import codology; print(codology.__version__)"
 uv run python -m examples.procurement_finance
 uv run python -m examples.atomic_approval
+uv run python -m examples.conditional_approval
 uv run pytest
 uv run pyright
 uv run ruff check .
@@ -96,6 +98,12 @@ examples/atomic_approval/
   wiring.py          # graph, deployment plan, adapter, principal và read grant
   consumer.py        # query -> row.as_ref() -> invoke, không chép luật nghiệp vụ
   __main__.py        # entry point chạy consumer trên DB thật
+examples/conditional_approval/
+  declarations.py    # runtime nấc 3: approval, child, effect, revision set mới
+  database.py        # schema SQLite và seed, helper đọc độc lập
+  wiring.py          # deployment, adapter, principal và authority live
+  consumer.py        # query/refs/invoke/callback/resume/reconcile/relay, không policy hay SQL
+  __main__.py        # entry point chạy mọi kịch bản có assert
 tests/
   test_annotations.py
   test_behavior.py
@@ -108,6 +116,7 @@ tests/
   test_package.py
   test_procurement_finance_integration.py
   test_atomic_approval_example.py # commit, denial, split binding, rollback, race, replay
+  test_conditional_approval_example.py # consumer nấc 3, đối chiếu DB độc lập
   test_snapshot.py
   test_manifest.py   # pin/resolve revision chính xác, digest byte đã nạp, fail closed
   test_waiting.py    # Ngưỡng chờ, replay, không lock/write, tenant và KEY_MISUSE
@@ -667,6 +676,20 @@ Kết quả in ra gồm `COMMITTED` với hai write cùng một transaction id, 
 
 `tests/test_atomic_approval_example.py` chạy chính các hàm consumer này rồi đọc lại DB bằng connection độc lập cho sáu nhóm: commit, read/invoke denial, split binding, rollback sau write đầu, hai đơn tranh một budget và replay sau mất phản hồi. Cách chạy, tập query được hỗ trợ và non-claims nằm ở [`examples/atomic_approval/README.md`](examples/atomic_approval/README.md).
 
+## Ví dụ consumer nấc 3: chờ duyệt và tiếp tục
+
+`examples/conditional_approval/` bàn giao toàn bộ đường consumer trên adapter SQLite thật:
+
+```bash
+uv run python -m examples.conditional_approval
+```
+
+Consumer đọc đơn qua `query`, lấy `VersionedRef` từ `row.as_ref()`, `invoke` action có `approval`/`effects`, rồi dùng callback key và fingerprint do engine phát hành cho `approve`/`reject`, gọi `resume`, `reconcile` và `read_effect_status`, cuối cùng giao outbox qua `deliver_committed`. Không có policy hay SQL trong caller; ngưỡng, role và `self_approval` nằm ở declaration, authority live do host cung cấp.
+
+Kết quả in ra gồm: dưới ngưỡng commit thẳng, tại ngưỡng chờ mà không ghi/không giữ transaction, replay sau restart dù revision mặc định đổi, callback outsider/`KEY_MISUSE` không chiếm key, duplicate idempotent, reject terminal, material đổi thì duyệt lại, hai resume tranh một budget chỉ ghi reservation một lần, mất ack commit vẫn reconcile được `COMMITTED`, và relay transient/permanent/lost ack giữ execution `COMMITTED` với đúng một thông báo địa phương. Mọi kỳ vọng được assert.
+
+`tests/test_conditional_approval_example.py` chạy chính các hàm consumer này rồi đọc lại bằng connection độc lập cho 13 ca: entry point, commit dưới ngưỡng, chờ không ghi/không giữ lock, restart/pin, deny/duplicate, reject, duyệt lại, tranh chấp, mất ack commit, ba nhánh relay và cửa đọc effect theo quyền/tenant. Hướng dẫn và non-claims nằm ở [`examples/conditional_approval/README.md`](examples/conditional_approval/README.md).
+
 ## Ví dụ Procurement/Finance
 
 `examples/procurement_finance/` là ví dụ chạy được trên chính API công khai ở trên: hai module Procurement và Finance, `ApprovePurchaseOrder` gọi `finance.reserve_budget`, kèm approval và effect metadata. Chạy từ gốc repo:
@@ -691,16 +714,17 @@ Không cần backend: handler chỉ là metadata và không được gọi. Decl
 - **Sổ yêu cầu bền vững:** scope key là `tenant / requester / action identity` (ổn định qua rollout version); dấu vân tay intent do engine recompute từ dữ liệu đã canonicalize, không phải digest handler. Key, intent và kết quả `COMMITTED` được ghi trong cùng transaction với mọi business write; replay trả kết quả cũ, còn tra cứu cần quyền đọc execution record. Bản ghi `AWAITING_APPROVAL` chiếm cùng key, kèm manifest đã pin, material intent và required approval; replay trả đúng execution đó.
 - **Tách authority của callback:** requester và approver là hai vai; host cung cấp role/permission/scope/revocation live, engine kiểm khóa, fingerprint, hạn và `self_approval` từ khai báo. Attempt bị từ chối chỉ vào audit, không chiếm khóa và không kết thúc execution; `reject` hợp lệ là terminal duy nhất không ghi nghiệp vụ, còn `approve` chỉ là decision chờ resume.
 - **Consumer mẫu trên adapter thật:** `examples/atomic_approval/` giữ phần caller chỉ ở `query`, `row.as_ref()` và `invoke`; quyền, ngân sách và write nằm trong declaration/handler và engine. Split binding nấc 2 (hai file cùng SQLite) vẫn bị từ chối trước runtime, không hạ xuống saga.
+- **Consumer nấc 3 trên adapter thật:** `examples/conditional_approval/` giữ caller ở các cửa công khai (`query`, `invoke`, `approve`/`reject`, `resume`, `reconcile`, `deliver_committed`, `read_effect_status`); fingerprint lấy từ execution record, không tự dựng policy hay SQL. Ví dụ nấc 2 `examples/atomic_approval/` vẫn chỉ phủ đường đồng bộ và không được đọc như consumer nấc 3.
 - Chi tiết và hệ quả cho các task sau: [`docs/official/design/implementation-baseline.md`](docs/official/design/implementation-baseline.md).
 
 ## Giới hạn
 
-- Đây vẫn là lớp mô hình tĩnh, manifest pin local trên graph đã link, deployment binding plan-check, adapter transaction có guarded write, cửa đọc có policy, cửa ghi `invoke()` với child đã link, sổ yêu cầu/kết quả bền vững, trạng thái chờ, cửa quyết định, resume và outbox intent đã ghi cùng commit. `examples/atomic_approval/` chỉ là consumer mẫu trên SQLite một file; chưa có publish artifact/registry hay effect delivery.
+- Đây vẫn là lớp mô hình tĩnh, manifest pin local trên graph đã link, deployment binding plan-check, adapter transaction có guarded write, cửa đọc có policy, cửa ghi `invoke()` với child đã link, sổ yêu cầu/kết quả bền vững, trạng thái chờ, cửa quyết định, resume, outbox intent cùng commit, relay local và consumer mẫu nấc 3. `examples/atomic_approval/` giữ consumer nấc 2; `examples/conditional_approval/` là consumer nấc 3 trên SQLite một file. Chưa có publish artifact/registry.
 
 - Load đã thu thập definition và kiểm tra identity/field; Link đã resolve reference, kiểm tra export/kind và chữ ký handler; snapshot đã công bố graph bất biến với lookup tường minh; `pin_manifest()`/`resolve_manifest()` đã pin và phân giải đúng revision kèm digest artifact; `bind_action()` đã kiểm tra capability, write set và enlistment plan trên snapshot; `waiting` lưu canonical input, material intent và approval dưới key duy nhất, `decision` giữ callback key, authority live và audit attempt, `gate_support` giữ kiểm tra thuần dùng chung, còn `results` tách representation và replay của execution. Adapter transaction thật đã có; chưa có registry bền vững hay publish artifact.
-- Predicate approval được đánh giá có cấu trúc tại cửa `invoke` cho nhánh chờ, kèm fingerprint của material intent; callback duyệt đã có cửa riêng với audit và idempotency, resume và outbox intent đã có; relay/giao effect vẫn chưa có. `Function` dùng cùng quy ước `handler(self, ctx, ...)` với `Action` theo implementation baseline.
+- Predicate approval được đánh giá có cấu trúc tại cửa `invoke` cho nhánh chờ, kèm fingerprint của material intent; callback, resume, outbox và relay/giao effect đã có bằng chứng chạy được qua consumer mẫu. `Function` dùng cùng quy ước `handler(self, ctx, ...)` với `Action` theo implementation baseline.
 
-- Bằng chứng invoke và callback chỉ phủ handler đơn, một child đã link và sổ yêu cầu/kết quả trên adapter SQLite đã bind: từ chối quyền/scope/type/ref cũ, `REJECTED`, guard stale, ghi ngoài declaration, child sai revision/quyền/scope, key trùng intent khác, race cùng key và hai đơn tranh một budget, split binding và replay sau mất phản hồi; phần chờ kiểm ngưỡng dưới/tại/trên, precondition rớt, replay sau mở lại engine và đổi revision mặc định, connection khác ghi được lúc chờ, không có write đơn/ngân sách/outbox và phân quyền tenant/đọc; phần quyết định kiểm outsider, sai tenant/scope/key/fingerprint, mất role/quyền, tự duyệt theo declaration, hết hạn/thu hồi/thay approval, replay có kiểm quyền, `KEY_MISUSE` và reject terminal một lần không ghi nghiệp vụ; phần outbox đối soát row bền bằng connection độc lập trên cả hai nhánh commit, không có row lúc chờ/từ chối/rollback/replay, dedup ổn định và payload/declaration sai bị chặn. Không có tuyên bố về publish artifact, effect delivery, PostgreSQL/ERP, mọi lịch trình interleaving hay sandbox handler trong-process.
+- Bằng chứng invoke và callback chỉ phủ handler đơn, một child đã link và sổ yêu cầu/kết quả trên adapter SQLite đã bind: từ chối quyền/scope/type/ref cũ, `REJECTED`, guard stale, ghi ngoài declaration, child sai revision/quyền/scope, key trùng intent khác, race cùng key và hai đơn tranh một budget, split binding và replay sau mất phản hồi; phần chờ kiểm ngưỡng dưới/tại/trên, precondition rớt, replay sau mở lại engine và đổi revision mặc định, connection khác ghi được lúc chờ, không có write đơn/ngân sách/outbox và phân quyền tenant/đọc; phần quyết định kiểm outsider, sai tenant/scope/key/fingerprint, mất role/quyền, tự duyệt theo declaration, hết hạn/thu hồi/thay approval, replay có kiểm quyền, `KEY_MISUSE` và reject terminal một lần không ghi nghiệp vụ; phần outbox đối soát row bền bằng connection độc lập trên cả hai nhánh commit, không có row lúc chờ/từ chối/rollback/replay, dedup ổn định và payload/declaration sai bị chặn. Phần relay kiểm committed-only, transient retry, permanent fail và lost ack với đúng một thông báo địa phương; consumer nấc 3 đối chiếu order/budget/ledger/outbox bằng connection độc lập. Không có tuyên bố về publish artifact, PostgreSQL/ERP, mọi lịch trình interleaving, crash/power-loss, exactly-once ngoài DB local hay sandbox handler trong-process.
 
 - Static validation không phát hiện truy cập ẩn trong thân handler (import lén, `getattr` động, đọc file/socket). Binding chỉ kiểm tra mapping khai báo; nó không phát hiện host code tự mở connection hoặc dùng credential ambient ngoài plan và không sandbox handler. Đó là rủi ro đã ghi nhận, xử lý bằng review và test.
 

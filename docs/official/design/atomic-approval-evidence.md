@@ -4,7 +4,7 @@
 
 *Phạm vi: kiểm chứng ba cơ chế — guarded debit trong enlisted transaction, replay idempotent sau mất phản hồi, và từ chối strict atomic khi hai resource không share enlisted session. Đây là bằng chứng runtime cho **một interleaving xác định**, không phải chứng minh contract đúng cho mọi lịch chạy, không phải so sánh hiệu năng, và không phải tích hợp ERP.*
 
-*Từ Sprint 4, framework có consumer mẫu chạy các cơ chế này trên chính API công khai và adapter SQLite của nó: [`examples/atomic_approval/`](../../../examples/atomic_approval/README.md), với kiểm thử tích hợp đọc lại DB cho commit, rollback, tranh budget, split binding và replay. Thí nghiệm dưới đây vẫn là bằng chứng độc lập, không bị thay thế bởi kiểm thử của framework.*
+*Từ Sprint 4, framework có consumer mẫu chạy các cơ chế này trên chính API công khai và adapter SQLite của nó: [`examples/atomic_approval/`](../../../examples/atomic_approval/README.md), với kiểm thử tích hợp đọc lại DB cho commit, rollback, tranh budget, split binding và replay. Sprint 5 bổ sung [`examples/conditional_approval/`](../../../examples/conditional_approval/README.md) cho đường chờ duyệt, resume và relay effect, cũng đối soát bằng connection độc lập. Thí nghiệm dưới đây vẫn là bằng chứng độc lập, không bị thay thế bởi kiểm thử của framework.*
 
 ## Câu hỏi và phạm vi
 
