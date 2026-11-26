@@ -12,7 +12,9 @@ from codology import (
     AllOf,
     ArtifactRevision,
     Assignment,
+    AwaitingExecution,
     Comparison,
+    ComparisonValue,
     Condition,
     DefinitionKey,
     Dependency,
@@ -22,24 +24,34 @@ from codology import (
     LoadedDeclarations,
     LoadedDefinition,
     LoadedModule,
+    MaterialIntent,
     MinorMoney,
+    ObjectVersion,
     OrderBy,
     PinnedManifest,
+    PredicateEvaluation,
     Principal,
     QueryPage,
     QueryRow,
     ReadGrant,
+    RequiredApproval,
     ResolvedManifest,
     Snapshot,
     SnapshotEntry,
     VersionedRef,
+    approval_deadline,
     authorize_read,
+    build_material_intent,
+    decode_awaiting,
     decode_manifest,
+    encode_awaiting,
     encode_manifest,
+    evaluate_predicate,
     is_issued_ref,
     link,
     load,
     manifest_digest,
+    new_approval,
     pin_manifest,
     resolve_manifest,
     snapshot,
@@ -48,6 +60,7 @@ from codology.declarations import ObjectRef
 from codology.engine import ActionResult, AttemptOutcome
 from examples.procurement_finance.finance import Budget
 from examples.procurement_finance.model import FINANCE_GROUP, PROCUREMENT_GROUP
+from examples.procurement_finance.procurement import ApprovePurchaseOrder
 
 loaded = load(PROCUREMENT_GROUP, FINANCE_GROUP)
 assert_type(loaded, LoadedDeclarations)
@@ -124,3 +137,46 @@ assert_type(
 assert_type(is_issued_ref(None), bool)
 assert_type(AttemptOutcome("COMMITTED", None), AttemptOutcome)
 assert_type(ActionResult(AttemptOutcome("DENIED", None)), ActionResult)
+
+assert_type(ComparisonValue("order", ("amount",), 100_000), ComparisonValue)
+assert_type(ObjectVersion("procurement.purchase_order", "PO-1", 1), ObjectVersion)
+assert_type(approval_deadline("2030-01-01T00:00:00Z"), str)
+assert_type(AttemptOutcome("AWAITING_APPROVAL", None), AttemptOutcome)
+intent = build_material_intent(
+    canonical_input={"order": {"amount": 120_000}},
+    comparisons=(ComparisonValue("order", ("amount",), 120_000),),
+    object_versions=(ObjectVersion("procurement.purchase_order", "PO-1", 1),),
+    pinned=pinned,
+)
+assert_type(intent, MaterialIntent)
+requester = Principal("alice", "A", frozenset({"purchase_order.read"}))
+required = new_approval(
+    role="finance_director",
+    tenant="A",
+    scope=("team1",),
+    requester=requester,
+    expires_at="2030-01-01T00:00:00Z",
+    self_approval=False,
+    intent_fingerprint=intent.fingerprint,
+    execution_id="EX-1",
+)
+assert_type(required, RequiredApproval)
+awaiting = AwaitingExecution(
+    "EX-1",
+    DefinitionKey("procurement.approve_purchase_order", "2.0.0"),
+    requester,
+    {"order": "PO-1"},
+    encode_manifest(pinned),
+    intent,
+    required,
+    "2026-01-01T00:00:00Z",
+)
+assert_type(awaiting, AwaitingExecution)
+assert_type(encode_awaiting(awaiting), str)
+assert_type(decode_awaiting(encode_awaiting(awaiting)), AwaitingExecution | None)
+approval = ApprovePurchaseOrder.approval
+assert approval is not None
+assert_type(
+    evaluate_predicate(approval.when, {"order": object(), "reason": "x"}),
+    PredicateEvaluation,
+)
