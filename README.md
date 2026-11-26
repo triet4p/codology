@@ -4,7 +4,7 @@ Codology (Ontology as Code) là lớp mô hình tĩnh cho phép developer khai b
 
 ## Trạng thái
 
-Repository đang ở Sprint 4 — Lát cắt thực thi nguyên tử. Phần đã có là project scaffold, hạ tầng khai báo tĩnh và deployment binding ở mức plan:
+Repository đang ở Sprint 4 — Lát cắt thực thi nguyên tử. Phần đã có là project scaffold, hạ tầng khai báo tĩnh, deployment binding ở mức plan và adapter SQLite cho transaction vật lý với guarded write:
 
 - `codology` import được từ môi trường sạch, không cần database, credential hay backend SDK.
 - `codology.declarations` cung cấp primitive cấu trúc bất biến `Module`, `ObjectType`, `Value`, `Link` và `ObjectRef[T]`: identity/version tường minh, property có kiểu, link có target/cardinality/traversal và `exports` đóng băng.
@@ -12,7 +12,8 @@ Repository đang ở Sprint 4 — Lát cắt thực thi nguyên tử. Phần đ�
 - Load, Link và `snapshot()` đã được triển khai; snapshot công bố graph đã link dưới dạng bất biến, tra cứu tường minh theo identity/version.
 - Ví dụ Procurement/Finance chạy được trên API thật (`examples/procurement_finance/`) cùng kiểm thử tích hợp và kiểm tra typing cho cả đường thành công lẫn lỗi tĩnh.
 - `bind_action()` kiểm tra deployment plan cho action `ATOMIC`: capability của provider, write set bắc cầu qua `calls`, một session enlist chung và mapping ủy quyền không rộng hơn contract; không gọi handler và không mở transaction.
-- Engine `query`/`invoke`, adapter transaction thật, authorization runtime, registry bền vững và publish artifact **chưa được triển khai**; các task sau trong sprint bổ sung dần.
+- `codology.adapter` mở đúng một transaction SQLite vật lý cho mọi write đã bind; `commit_guarded_writes()` là biên commit do engine/port sở hữu, rollback sạch trước commit và chỉ coi `rowcount == 1` là thành công. Tiền được biểu diễn bằng số nguyên đơn vị nhỏ (`MinorMoney`) với một currency cố định, không FX.
+- Engine `query`/`invoke`, authorization runtime, sổ yêu cầu bền vững và publish artifact **chưa được triển khai**; các task sau trong sprint bổ sung dần.
 
 ## Yêu cầu
 
@@ -48,6 +49,10 @@ src/codology/
   linking.py        # Link: resolve reference, export, kind và chữ ký handler
   snapshot.py       # Snapshot: graph đã link bất biến, lookup identity/version
   binding.py        # Deployment binding: capability, write set, enlistment plan
+  money.py          # MinorMoney: số nguyên đơn vị nhỏ, một currency
+  ports.py          # Port lõi: guarded write, transaction, kết quả apply
+  uow.py            # Biên commit do engine/port sở hữu
+  adapter.py        # Adapter SQLite: một session, một transaction vật lý
   declarations/
     __init__.py
     annotations.py   # giữ annotation thô, resolve ở pha Link
@@ -65,6 +70,7 @@ tests/
   test_annotations.py
   test_behavior.py
   test_binding.py
+  test_transaction.py # rollback, guard/version, rowcount, tranh chấp hai connection
   test_declarations.py
   test_handler.py
   test_linking.py
@@ -278,6 +284,57 @@ Binding kiểm tra bốn điều:
 
 `BoundAction` trả `writes` kèm `via` (đường đi từ root qua `calls`), `calls`, `delegations` và `session` — plan một session dùng cho UoW. Metadata `ATOMIC` đã bind **không** chứng minh backend đáp ứng atomicity; phần đó thuộc adapter và kiểm chứng runtime.
 
+## Transaction vật lý và guarded write
+
+`SQLiteProvider` là adapter file-backed cho đúng một session đã bind. `commit_guarded_writes()` mở một `BEGIN IMMEDIATE` trên một connection, áp dụng mọi `GuardedWrite` trên connection đó rồi commit **một lần**; bất kỳ lỗi nào trước commit đều rollback. Handler không nhận được `commit`/`rollback` và không thấy connection.
+
+```python
+from decimal import Decimal
+
+from codology import bind_action  # plan = SessionPlan từ bind_action()
+from codology.adapter import ResourceBinding, SQLiteProvider
+from codology.money import MinorMoney
+from codology.ports import Assignment, Condition, GuardedWrite
+from codology.uow import commit_guarded_writes
+
+amount = MinorMoney.from_decimal(Decimal("40000"), "VND")
+provider = SQLiteProvider(
+    "orders.sqlite3",
+    "sqlite:main",
+    (
+        ResourceBinding("finance.budget", "budgets", ("balance",), currency="VND"),
+        ResourceBinding(
+            "procurement.purchase_order", "purchase_orders",
+            ("status", "approved_amount"), currency="VND",
+        ),
+    ),
+)
+results = commit_guarded_writes(
+    provider,
+    plan,
+    (
+        GuardedWrite(
+            "finance.budget", "B-001", 1,
+            (Assignment("balance", "add", -amount),),
+            (Condition("balance", ">=", amount),),
+        ),
+        GuardedWrite(
+            "procurement.purchase_order", "PO-001", 1,
+            (
+                Assignment("status", "set", "APPROVED"),
+                Assignment("approved_amount", "set", amount),
+            ),
+            (Condition("status", "==", "PENDING_APPROVAL"),),
+        ),
+    ),
+)
+assert all(result.rowcount == 1 for result in results)
+```
+
+Mỗi guarded write gồm `expected_version`, phép gán và điều kiện; adapter thêm guard `version = expected_version` và tăng version trong cùng một `UPDATE`. `rowcount != 1` ném `StalePlan` và không ghi đè. Adapter chỉ nhận `int`, `str`, `bytes`, `None` và `MinorMoney` — `float`/`Decimal` thô bị từ chối; `MinorMoney` được kiểm currency theo resource. Tiền lưu dưới dạng số nguyên đơn vị nhỏ, một currency cho ví dụ; không quy đổi, không FX. Tên bảng và cột phải là identifier thường, được khai báo trong `ResourceBinding`.
+
+Đây là bằng chứng cơ chế trên SQLite file và **một** interleaving có điều khiển, không phải chứng minh mọi lịch chạy hay hành vi PostgreSQL/ERP. Session được xác nhận lúc mở transaction (`SessionMismatch` nếu plan trỏ session khác); ledger, authorize và handler vẫn thuộc task sau.
+
 ## Ví dụ Procurement/Finance
 
 `examples/procurement_finance/` là ví dụ chạy được trên chính API công khai ở trên: hai module Procurement và Finance, `ApprovePurchaseOrder` gọi `finance.reserve_budget`, kèm approval và effect metadata. Chạy từ gốc repo:
@@ -295,14 +352,15 @@ Không cần backend: handler chỉ là metadata và không được gọi. Hư�
 - **Một quy ước handler duy nhất:** `def handler(self, ctx, ...)` trên class khai báo. `@staticmethod def handle(...)` không được hỗ trợ; không có API thứ hai để giữ đồng bộ. `self` không mang execution state.
 - **Forward reference không import vòng:** annotation được giữ nguyên dạng viết lúc tạo class và chỉ resolve ở pha Link bằng namespace đã compose từ mọi module tham gia link. Hai module có thể tham chiếu kiểu của nhau mà không import nhau lúc chạy.
 - **Layout và công cụ:** source đặt trong `src/codology/`, đóng gói bằng Hatchling, quản lý bằng uv; kiểm thử bằng pytest; type-check bằng Pyright strict; lint/format bằng Ruff.
+- **Adapter và tiền chính xác:** SQLite file-backed, một session vật lý cho mọi write đã bind; `MinorMoney` lưu số nguyên đơn vị nhỏ với một currency, không float và không FX.
 - Chi tiết và hệ quả cho các task sau: [`docs/official/design/implementation-baseline.md`](docs/official/design/implementation-baseline.md).
 
 ## Giới hạn
 
-- Đây vẫn là lớp mô hình tĩnh cộng deployment binding plan-check. Chưa có engine `query`/`invoke`, authorization, session/Unit of Work, atomic commit, approval callback hay effect delivery.
-- Load đã thu thập definition và kiểm tra identity/field; Link đã resolve reference, kiểm tra export/kind và chữ ký handler; snapshot đã công bố graph bất biến với lookup tường minh; `bind_action()` đã kiểm tra capability, write set và enlistment plan trên snapshot. Adapter transaction thật, registry bền vững và publish artifact thuộc các task kế tiếp.
+- Đây vẫn là lớp mô hình tĩnh, deployment binding plan-check và adapter transaction có guarded write. Chưa có engine `query`/`invoke`, authorization, UoW cho handler, sổ yêu cầu/kết quả hay effect delivery.
+- Load đã thu thập definition và kiểm tra identity/field; Link đã resolve reference, kiểm tra export/kind và chữ ký handler; snapshot đã công bố graph bất biến với lookup tường minh; `bind_action()` đã kiểm tra capability, write set và enlistment plan trên snapshot. Adapter transaction thật đã có; registry bền vững và publish artifact thuộc các task kế tiếp.
 - Predicate approval chỉ được lưu dạng cấu trúc; chưa có đánh giá ngưỡng, callback duyệt hay giao effect. `Function` dùng cùng quy ước `handler(self, ctx, ...)` với `Action` theo implementation baseline.
-- Không có tuyên bố runtime `ATOMIC`, authorization hay execution đã hoạt động. Binding chỉ chứng minh plan khai báo đủ capability và một session enlist; nó không mở transaction, không xác nhận session vật lý đang mở và không chứng minh backend atomicity.
+- Không có tuyên bố engine `query`/`invoke`, authorization hay execution đã hoạt động. Adapter chứng minh một transaction vật lý và guard trên SQLite; binding vẫn chỉ là plan-check, không thay cho runtime proof trên backend khác. Bằng chứng chỉ phủ các interleaving đã kiểm (rollback, guard, tranh chấp hai connection), không phải mọi lịch chạy, PostgreSQL/ERP hay mất phản hồi sau commit (sổ kết quả thuộc task sau).
 - Static validation không phát hiện truy cập ẩn trong thân handler (import lén, `getattr` động, đọc file/socket). Binding chỉ kiểm tra mapping khai báo; nó không phát hiện host code tự mở connection hoặc dùng credential ambient ngoài plan và không sandbox handler. Đó là rủi ro đã ghi nhận, xử lý bằng review và test.
 
 ## Tài liệu

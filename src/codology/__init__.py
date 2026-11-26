@@ -1,10 +1,12 @@
 """Codology's import root.
 
 The package ships the static declaration layer, Load, Link, an immutable
-snapshot view, and deployment binding. Binding validates a deployment plan
-against a published graph without calling a handler or opening a transaction;
-engine and adapter modules do not exist yet. Importing ``codology`` must never
-require a database, credentials, or a backend SDK.
+snapshot view, deployment binding, and core ports for physical transactions.
+Binding validates a deployment plan without calling a handler or opening a
+transaction; the commit boundary and exact money value live in the core.
+Adapter implementations are separate modules and are never imported here.
+Importing ``codology`` must never require a database, credentials, or a
+backend SDK.
 """
 
 from codology.binding import (
@@ -55,6 +57,17 @@ from codology.loading import (
     UnknownDeclarationKey,
     load,
 )
+from codology.money import MinorMoney
+from codology.ports import (
+    ApplyResult,
+    Assignment,
+    Condition,
+    GuardedWrite,
+    SessionMismatch,
+    StalePlan,
+    TransactionProvider,
+    UnitOfWork,
+)
 from codology.snapshot import (
     AllOfExpr,
     AnyOfExpr,
@@ -71,6 +84,7 @@ from codology.snapshot import (
     UnknownDefinition,
     snapshot,
 )
+from codology.uow import UnboundWriteAttempt, commit_guarded_writes
 
 __version__ = "0.1.0"
 
@@ -79,7 +93,9 @@ __all__ = [
     "AmbientServiceIdentity",
     "AmbiguousEnlistment",
     "AnyOfExpr",
+    "ApplyResult",
     "ApprovalView",
+    "Assignment",
     "BindingError",
     "BoundAction",
     "BoundCall",
@@ -87,6 +103,7 @@ __all__ = [
     "BoundWrite",
     "Capability",
     "ComparisonExpr",
+    "Condition",
     "DefinitionKey",
     "DelegationError",
     "DelegationGrant",
@@ -97,6 +114,7 @@ __all__ = [
     "Enlistment",
     "Expression",
     "FieldPath",
+    "GuardedWrite",
     "HandlerMismatch",
     "InconsistentSession",
     "LinkError",
@@ -107,6 +125,7 @@ __all__ = [
     "LoadedModule",
     "LoadError",
     "LiteralValue",
+    "MinorMoney",
     "MissingCapability",
     "ModuleDeclarations",
     "NoSharedTransaction",
@@ -117,11 +136,16 @@ __all__ = [
     "PermissionBroadened",
     "Provider",
     "ResolvedReference",
+    "SessionMismatch",
     "SessionPlan",
     "Snapshot",
     "SnapshotEntry",
+    "StalePlan",
+    "TransactionProvider",
     "UnboundWrite",
+    "UnboundWriteAttempt",
     "UndeclaredCall",
+    "UnitOfWork",
     "UnresolvedReference",
     "UnknownDeclarationKey",
     "UnknownDefinition",
@@ -129,6 +153,7 @@ __all__ = [
     "WrongKind",
     "__version__",
     "bind_action",
+    "commit_guarded_writes",
     "link",
     "load",
     "snapshot",
