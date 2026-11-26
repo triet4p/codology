@@ -537,6 +537,8 @@ def _arguments(
     provider: ScopedEngineProvider,
     principal: Principal,
     grants: Mapping[DefinitionKey, ReadGrant],
+    *,
+    allow_version_change: bool = False,
 ) -> dict[str, object]:
     declaration = cast(type[Action], entry.definition.declaration)
     if set(parameters) != set(declaration.properties):
@@ -554,7 +556,9 @@ def _arguments(
             typed = cast(VersionedRef[object], value)
             if typed.definition != expected:
                 raise InvokeDenied("the ref does not match the declared parameter type.")
-            arguments[name] = _resolve_scoped(provider, principal, grants, typed)
+            arguments[name] = _resolve_scoped(
+                provider, principal, grants, typed, allow_version_change=allow_version_change
+            )
             continue
         if isinstance(hint, type) and not isinstance(value, hint):
             raise InvokeDenied("a parameter has the wrong declared type.")
@@ -569,6 +573,8 @@ def _child_arguments(
     parameters: Mapping[str, object],
     execution: _Execution,
     principal: Principal,
+    *,
+    allow_version_change: bool = False,
 ) -> dict[str, object]:
     """Resolve child parameters against the child's own linked contract and live scope."""
     declaration = cast(type[Action], entry.definition.declaration)
@@ -589,7 +595,11 @@ def _child_arguments(
             if typed.definition != expected:
                 raise InvokeDenied("the child ref does not match the declared parameter type.")
             arguments[name] = _resolve_scoped(
-                execution.provider, principal, execution.grants, typed
+                execution.provider,
+                principal,
+                execution.grants,
+                typed,
+                allow_version_change=allow_version_change,
             )
             continue
         if isinstance(hint, type) and not isinstance(value, hint):
@@ -605,6 +615,8 @@ def _resolve_scoped(
     principal: Principal,
     grants: Mapping[DefinitionKey, ReadGrant],
     ref: VersionedRef[object],
+    *,
+    allow_version_change: bool = False,
 ) -> ResolvedObject[object]:
     grant = grants.get(ref.definition)
     if grant is None:
@@ -613,7 +625,7 @@ def _resolve_scoped(
     row = provider.resolve(ref, grant)
     if row is None:
         raise InvokeDenied("the ref is outside the current tenant or scope.")
-    if row.instance_version != ref.instance_version:
+    if row.instance_version != ref.instance_version and not allow_version_change:
         raise _Stale()
     return _resolved(row)
 
@@ -650,7 +662,68 @@ def _guarded(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class RecomputedPlan:
+    """A fresh handler run: guarded registrations, children, resolved arguments."""
+
+    registrations: tuple[_Registration, ...]
+    children: tuple[DefinitionKey, ...]
+    arguments: Mapping[str, object]
+    declaration: type[Action]
+
+
+def recompute_action(
+    *,
+    linked: LinkedDeclarations,
+    action: DefinitionKey,
+    bound: BoundAction,
+    provider: ScopedEngineProvider,
+    principal: Principal,
+    grants: Mapping[DefinitionKey, ReadGrant],
+    parameters: Mapping[str, object],
+    allow_version_change: bool = False,
+) -> RecomputedPlan:
+    """Run a pinned root and its children once on the current world, without committing."""
+    entry = linked_action(linked, action, bound)
+    declaration = cast(type[Action], entry.definition.declaration)
+    if declaration.permission not in principal.permissions:
+        raise InvokeDenied("the requester lacks the action's invoke permission.")
+    if declaration.approval is None:
+        raise InvokeDenied("only an approval-declared action can be resumed.")
+    if declaration.effects:
+        raise InvokeDenied(
+            "this declaration needs effect governance a synchronous invoke cannot honor."
+        )
+    arguments = _arguments(
+        entry,
+        action,
+        parameters,
+        provider,
+        principal,
+        grants,
+        allow_version_change=allow_version_change,
+    )
+    columns = {identity: tuple(spec.columns) for identity, spec in provider.resources.items()}
+    allowed_writes = declared_writes(linked, declaration.writes)
+    require_writes(bound, allowed_writes)
+    execution = _Execution(linked, bound, provider, grants, columns, [], [])
+    ctx = HandlerCtx(
+        principal=principal,
+        reads=defined_keys(linked, declaration.reads),
+        writes=allowed_writes,
+        calls=bound.calls,
+        delegations=bound.delegations,
+        execution=execution,
+    )
+    handler = cast(Callable[..., object], vars(declaration)["handler"])
+    handler(declaration(), ctx, **arguments)
+    return RecomputedPlan(
+        tuple(execution.registrations), tuple(execution.children), arguments, declaration
+    )
+
+
 def _children(execution: _Execution | None) -> tuple[DefinitionKey, ...]:
+    """Return the child revisions a handler run reached, if any."""
     return () if execution is None else tuple(execution.children)
 
 
@@ -662,6 +735,20 @@ def _rejected(
 ) -> ActionResult:
     record = ExecutionRecord(uuid.uuid4().hex, "REJECTED", action, principal, (), children)
     return ActionResult(AttemptOutcome("REJECTED", detail), record)
+
+
+def guard_recomputed(
+    registrations: tuple[_Registration, ...],
+    bound: BoundAction,
+    provider: ScopedEngineProvider,
+    principal: Principal,
+    grants: Mapping[DefinitionKey, ReadGrant],
+) -> tuple[GuardedWrite, ...]:
+    """Re-resolve a recomputed plan under live scope and turn staleness into a port error."""
+    try:
+        return _guarded(registrations, bound, provider, principal, grants)
+    except _Stale as exc:
+        raise StalePlan("resolved", "", -1, 0, "resume") from exc
 
 
 __all__ = [
@@ -683,5 +770,8 @@ __all__ = [
     "ScopedUoW",
     "WriteNotDeclared",
     "invoke",
+    "RecomputedPlan",
+    "recompute_action",
+    "guard_recomputed",
     "reconcile",
 ]

@@ -196,6 +196,17 @@ def _approval_id(execution_id: str, callback_key: str) -> str | None:
     return approval_id if approval_id and ":" not in approval_id else None
 
 
+def _expiry(approval: RequiredApproval, now: datetime) -> tuple[bool, str | None]:
+    """Return whether a pinned deadline has passed, or why it cannot be checked."""
+    try:
+        deadline = datetime.fromisoformat(approval.expires_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False, "the approval deadline cannot be verified."
+    if deadline.tzinfo is None:
+        return False, "the approval deadline is not time-zone aware."
+    return now > deadline, None
+
+
 def _authorize(
     authority: ApprovalAuthority,
     principal: Principal,
@@ -203,11 +214,12 @@ def _authorize(
     *,
     now: datetime,
     check_expiry: bool,
+    check_revocation: bool = True,
 ) -> str | None:
     """Return the first closed-gate reason, or None when the approver qualifies."""
     if principal.tenant != approval.tenant or authority.tenant != approval.tenant:
         return "the approver is outside the approval tenant."
-    if authority.revoked:
+    if check_revocation and authority.revoked:
         return "the approval was revoked."
     if not approval.permission or approval.permission not in authority.permissions:
         return "the approver lacks the live approval permission."
@@ -218,15 +230,53 @@ def _authorize(
     if not approval.self_approval and principal.identity == approval.requester.identity:
         return "self approval is not allowed by the declaration."
     if check_expiry:
-        try:
-            deadline = datetime.fromisoformat(approval.expires_at.replace("Z", "+00:00"))
-        except ValueError:
-            return "the approval deadline cannot be verified."
-        if deadline.tzinfo is None:
-            return "the approval deadline is not time-zone aware."
-        if now > deadline:
+        expired, detail = _expiry(approval, now)
+        if detail is not None:
+            return detail
+        if expired:
             return "the approval has expired."
     return None
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorityVerdict:
+    """Live authority facts a resume needs to distinguish denial from reapproval."""
+
+    detail: str | None
+    expired: bool
+    revoked: bool
+    revision: str | None
+
+
+def live_authority(
+    provider: ApprovalAuthorityProvider,
+    principal: Principal,
+    approval: RequiredApproval,
+) -> ApprovalAuthority:
+    """Read the host's current authority for an approval, failing closed on outage."""
+    return _live_authority(provider, principal, approval)
+
+
+def authority_verdict(
+    authority: ApprovalAuthority,
+    principal: Principal,
+    approval: RequiredApproval,
+    *,
+    now: datetime,
+) -> AuthorityVerdict:
+    """Check role, permission, tenant and scope apart from expiry and revocation."""
+    detail = _authorize(
+        authority,
+        principal,
+        approval,
+        now=now,
+        check_expiry=False,
+        check_revocation=False,
+    )
+    if detail is not None:
+        return AuthorityVerdict(detail, False, False, authority.revision)
+    expired, expiry_detail = _expiry(approval, now)
+    return AuthorityVerdict(expiry_detail, expired, authority.revoked, authority.revision)
 
 
 def _execution_record(
@@ -586,6 +636,7 @@ def stored_decision(document: object) -> DecisionRecord | None:
 __all__ = [
     "ApprovalAuthority",
     "ApprovalAuthorityProvider",
+    "AuthorityVerdict",
     "DecisionAttempt",
     "DecisionCode",
     "DecisionKind",
@@ -594,6 +645,8 @@ __all__ = [
     "DecisionResult",
     "DecisionUnitOfWork",
     "ExecutionSnapshot",
+    "authority_verdict",
+    "live_authority",
     "approve",
     "decode_principal",
     "encode_principal",

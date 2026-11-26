@@ -97,6 +97,7 @@ class MaterialIntent:
     manifest_digest: str
     children: tuple[str, ...]
     fingerprint: str
+    cycle: int = 0
 
     @property
     def child_keys(self) -> tuple[DefinitionKey, ...]:
@@ -108,7 +109,7 @@ class MaterialIntent:
         return tuple(keys)
 
     def document(self) -> dict[str, object]:
-        return {
+        document: dict[str, object] = {
             "canonical_input": self.canonical_input,
             "comparisons": [item.document() for item in self.comparisons],
             "object_versions": [item.document() for item in self.object_versions],
@@ -117,6 +118,9 @@ class MaterialIntent:
             "children": list(self.children),
             "fingerprint": self.fingerprint,
         }
+        if self.cycle:
+            document["cycle"] = self.cycle
+        return document
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,8 +270,11 @@ def build_material_intent(
     comparisons: tuple[ComparisonValue, ...],
     object_versions: tuple[ObjectVersion, ...],
     pinned: PinnedManifest,
+    cycle: int = 0,
 ) -> MaterialIntent:
     """Freeze what the approver sees, using the manifest T1 already pinned."""
+    if type(cycle) is not int or cycle < 0:
+        raise ValueError("a material intent cycle must be a non-negative integer.")
     children = tuple(f"{item.identity}@{item.version}#{item.digest}" for item in pinned.children)
     intent = MaterialIntent(
         canonical_input,
@@ -277,6 +284,7 @@ def build_material_intent(
         manifest_digest(pinned),
         children,
         "",
+        cycle,
     )
     digest = hashlib.sha256(serialize({"material_intent": intent.document()}).encode("utf-8"))
     return MaterialIntent(
@@ -287,6 +295,7 @@ def build_material_intent(
         intent.manifest_digest,
         intent.children,
         digest.hexdigest(),
+        cycle,
     )
 
 
@@ -417,21 +426,20 @@ def _decode_object_version(value: object) -> ObjectVersion:
 
 def _decode_material_intent(value: object) -> MaterialIntent:
     document = _as_document(value, "material_intent")
-    _exact(
-        document,
-        frozenset(
-            {
-                "canonical_input",
-                "comparisons",
-                "object_versions",
-                "pinned_manifest",
-                "manifest_digest",
-                "children",
-                "fingerprint",
-            }
-        ),
-        "material_intent",
+    keys = frozenset(document)
+    required = frozenset(
+        {
+            "canonical_input",
+            "comparisons",
+            "object_versions",
+            "pinned_manifest",
+            "manifest_digest",
+            "children",
+            "fingerprint",
+        }
     )
+    if keys not in (required, required | {"cycle"}):
+        raise InvalidAwaitingRecord("material_intent has unexpected or missing fields.")
     canonical = _as_document(document["canonical_input"], "material_intent.canonical_input")
     comparisons = tuple(
         _decode_comparison(item)
@@ -445,6 +453,9 @@ def _decode_material_intent(value: object) -> MaterialIntent:
         _text(item, "material_intent.children")
         for item in _sequence(document["children"], "material_intent.children")
     )
+    cycle = document.get("cycle", 0)
+    if type(cycle) is not int or cycle < 0:
+        raise InvalidAwaitingRecord("material_intent.cycle must be a non-negative integer.")
     return MaterialIntent(
         canonical,
         comparisons,
@@ -453,6 +464,7 @@ def _decode_material_intent(value: object) -> MaterialIntent:
         _text(document["manifest_digest"], "material_intent.manifest_digest"),
         children,
         _text(document["fingerprint"], "material_intent.fingerprint"),
+        cycle,
     )
 
 

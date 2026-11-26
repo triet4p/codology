@@ -15,6 +15,7 @@ from codology import (
     ArtifactRevision,
     Assignment,
     AwaitingExecution,
+    BoundAction,
     Comparison,
     ComparisonValue,
     Condition,
@@ -65,6 +66,7 @@ from codology import (
 from codology.decision import decode_principal, encode_principal
 from codology.declarations import ObjectRef
 from codology.engine import ActionResult, AttemptOutcome
+from codology.resume import ResumeOutcome, ResumeProvider, reconcile_execution, resume
 from examples.procurement_finance.finance import Budget
 from examples.procurement_finance.model import FINANCE_GROUP, PROCUREMENT_GROUP
 from examples.procurement_finance.procurement import ApprovePurchaseOrder
@@ -222,3 +224,26 @@ assert_type(
     ),
     DecisionResult,
 )
+
+resume_provider = cast(ResumeProvider, None)
+bound_plan = cast(BoundAction, None)
+resume_grants: Mapping[DefinitionKey, ReadGrant] = {}
+assert_type(
+    resume(
+        provider=resume_provider,
+        revisions=(linked,),
+        bound=bound_plan,
+        principal=requester,
+        grants=resume_grants,
+        execution_id="EX-1",
+        callback_key="EX-1:AP-1",
+        authority_provider=gate_source,
+    ),
+    ActionResult,
+)
+assert_type(
+    reconcile_execution(provider=resume_provider, principal=requester, execution_id="EX-1"),
+    ActionResult,
+)
+recorded_outcome = ResumeOutcome("EX-1:AP-1", "EX-1", "COMMITTED", None, "2030-01-01T00:00:00Z")
+assert_type(recorded_outcome, ResumeOutcome)
