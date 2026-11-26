@@ -19,6 +19,14 @@ from types import MappingProxyType
 from typing import Protocol, cast
 
 from codology.binding import BoundAction, BoundCall, BoundDelegation, SessionPlan
+from codology.decision import (
+    ApprovalAuthority,
+    ApprovalAuthorityProvider,
+    DecisionProvider,
+    DecisionResult,
+    approve,
+    reject,
+)
 from codology.declarations import Action, ObjectRef
 from codology.gate_support import (
     InvokeDenied,
@@ -428,6 +436,7 @@ def invoke(
                 principal=principal,
                 scopes=scopes,
                 expires_at=approval_expires_at,
+                permission=declaration.permission,
             )
             if awaiting is not None:
                 if scope is None or request_key is None or fingerprint is None:
@@ -656,6 +665,12 @@ def _rejected(
 
 
 __all__ = [
+    "ApprovalAuthority",
+    "ApprovalAuthorityProvider",
+    "DecisionProvider",
+    "DecisionResult",
+    "approve",
+    "reject",
     "ActionResult",
     "AttemptOutcome",
     "BusinessRejected",
