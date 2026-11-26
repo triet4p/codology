@@ -19,7 +19,7 @@ from codology.ports import UnitOfWork
 from codology.query import Principal, VersionedRef
 from codology.snapshot import DefinitionKey
 
-LedgerStatus = Literal["COMMITTED", "AWAITING_APPROVAL"]
+LedgerStatus = Literal["COMMITTED", "AWAITING_APPROVAL", "REJECTED"]
 
 EXECUTION_READ_PERMISSION = "execution.read"
 
@@ -74,8 +74,8 @@ class LedgerEntry:
         _require_text(self.execution_id, "LedgerEntry.execution_id")
         _require_text(self.action_version, "LedgerEntry.action_version")
         _require_text(self.payload, "LedgerEntry.payload")
-        if self.status not in ("COMMITTED", "AWAITING_APPROVAL"):
-            raise ValueError("only an authoritative COMMITTED or waiting result is stored.")
+        if self.status not in ("COMMITTED", "AWAITING_APPROVAL", "REJECTED"):
+            raise ValueError("only an authoritative result status is stored.")
 
 
 class LedgerUnitOfWork(UnitOfWork, Protocol):

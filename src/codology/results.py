@@ -126,18 +126,16 @@ def stored_result(record: ExecutionRecord) -> StoredResult:
 
 def replay(stored: LedgerEntry) -> ActionResult | None:
     """Rebuild an execution from a trusted ledger record, or fail closed."""
-    if stored.status == "AWAITING_APPROVAL":
+    if stored.status in ("AWAITING_APPROVAL", "REJECTED"):
         waiting = decode_awaiting(stored.payload)
         if waiting is None:
             return None
         intent = waiting.material_intent
         return ActionResult(
-            AttemptOutcome(
-                "AWAITING_APPROVAL", None, stored.request_key, stored.intent_fingerprint
-            ),
+            AttemptOutcome(stored.status, None, stored.request_key, stored.intent_fingerprint),
             ExecutionRecord(
                 waiting.execution_id,
-                "AWAITING_APPROVAL",
+                stored.status,
                 waiting.action,
                 waiting.requester,
                 (),
