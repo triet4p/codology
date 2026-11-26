@@ -4,7 +4,7 @@ Codology (Ontology as Code) là framework khai báo thực thể, quan hệ và 
 
 ## Trạng thái
 
-Sprint 4 đã hoàn tất với lát cắt thực thi nguyên tử đồng bộ. [Sprint 5](docs/sprint-plans/sprint-5.md) đang triển khai từng phần: manifest ghim revision và trạng thái chờ ở cửa `invoke` đã có; callback duyệt, resume và giao effect vẫn chưa được hỗ trợ. Các phần đã có:
+Sprint 4 đã hoàn tất với lát cắt thực thi nguyên tử đồng bộ. [Sprint 5](docs/sprint-plans/sprint-5.md) đang triển khai từng phần: manifest ghim revision, trạng thái chờ ở cửa `invoke` và cửa quyết định duyệt đã có; resume và giao effect vẫn chưa được hỗ trợ. Các phần đã có:
 
 - `codology` import được từ môi trường sạch, không cần database, credential hay backend SDK.
 - `codology.declarations` cung cấp primitive cấu trúc bất biến `Module`, `ObjectType`, `Value`, `Link` và `ObjectRef[T]`: identity/version tường minh, property có kiểu, link có target/cardinality/traversal và `exports` đóng băng.
@@ -12,6 +12,7 @@ Sprint 4 đã hoàn tất với lát cắt thực thi nguyên tử đồng bộ.
 - Load, Link và `snapshot()` đã được triển khai; snapshot công bố graph đã link dưới dạng bất biến, tra cứu tường minh theo identity/version.
 - `pin_manifest()` / `resolve_manifest()` định nghĩa một manifest bền vững cho logic của execution: root Action, child Action/Function, effect và ontology revision đã khai báo, mỗi revision kèm digest SHA-256 của source module thực sự nạp. Host giữ nhiều revision set vẫn phân giải đúng revision đã ghim, không dùng default/latest; artifact thiếu, byte đổi, kind đổi hoặc closure khác bị từ chối trước khi chạy handler. Chưa có publish pipeline hay registry.
 - `engine.invoke()` đã ghi trạng thái chờ bền: declaration có `approval` chạy handler trong preview rồi bỏ preview, trả `AWAITING_APPROVAL` kèm execution ID, manifest đã pin, `material_intent` và `required_approval`; sổ yêu cầu giữ một key duy nhất, không giữ transaction hay write đơn/ngân sách/outbox. Dưới ngưỡng đi tiếp đường nguyên tử; declaration có `effects` vẫn bị từ chối tường minh.
+- `engine.approve()` / `engine.reject()` kiểm callback key gắn execution và approval hiện hành, fingerprint của material intent, role/permission live do host cung cấp, tenant/scope và `self_approval`; decision được ghi riêng và audit mọi attempt. `reject` hợp lệ chỉ chuyển execution sang `REJECTED` không ghi nghiệp vụ; approve hợp lệ là đầu vào cho resume, chưa phải commit.
 - Ví dụ Procurement/Finance chạy được trên API thật (`examples/procurement_finance/`) cùng kiểm thử tích hợp và kiểm tra typing cho cả đường thành công lẫn lỗi tĩnh.
 - Ví dụ thực thi (`examples/atomic_approval/`) chạy đường consumer `query → row.as_ref() → invoke` nấc 2 trên adapter SQLite thật: commit đơn và giữ ngân sách trong một transaction, replay theo `request_key`, cùng các nhánh read/invoke denial và split binding. Kiểm thử tích hợp đọc lại dữ liệu bằng connection độc lập.
 - `bind_action()` kiểm tra deployment plan cho action `ATOMIC`: capability của provider, write set bắc cầu qua `calls`, một session enlist chung và mapping ủy quyền không rộng hơn contract; không gọi handler và không mở transaction.
@@ -55,6 +56,7 @@ src/codology/
   manifest.py       # Manifest ghim: digest artifact, resolve revision chính xác
   waiting.py        # Trạng thái chờ: canonical input, material intent, approval bền
   gate_support.py   # Kiểm tra plan/graph thuần dùng chung cho hai nhánh invoke
+  decision.py       # Cửa quyết định: authority live, callback key, audit, terminal reject
   results.py        # Attempt/execution record, replay có quyền và reconcile
   binding.py        # Deployment binding: capability, write set, enlistment plan
   money.py          # MinorMoney: số nguyên đơn vị nhỏ, một currency
@@ -292,7 +294,7 @@ assert resolved.root.definition.version == "2.0.0"
 
 `resolve_manifest()` không có default/latest. Với một hoặc nhiều `LinkedDeclarations` của host, nó chỉ chấp nhận set mà: mọi revision đã pin có mặt đúng version; closure `calls`/`effects`/ontology từ root khớp chính xác manifest; kind và digest của artifact khớp. Thiếu artifact, byte đổi, kind đổi hoặc composition trỏ sang revision khác đều raise `MissingArtifact`, `DigestMismatch`, `KindMismatch` hay `ClosureMismatch` trước khi bất kỳ handler nào chạy. `manifest_digest()` định danh chính manifest bằng bytes canonical của nó.
 
-Đây là pin local trên graph đã link: không có registry, build artifact hay publish pipeline, và manifest không tự cấp quyền chạy logic. Declaration có `effects` vẫn bị `invoke` từ chối tường minh; approval đã có nhánh chờ ở cửa invoke nhưng decision/resume chưa được hỗ trợ.
+Đây là pin local trên graph đã link: không có registry, build artifact hay publish pipeline, và manifest không tự cấp quyền chạy logic. Declaration có `effects` vẫn bị `invoke` từ chối tường minh; approval đã có nhánh chờ ở cửa invoke và cửa quyết định, resume chưa được hỗ trợ.
 
 ## Invoke chờ duyệt: ghi trạng thái bền, không giữ transaction
 
@@ -306,7 +308,26 @@ if result.attempt.code == "AWAITING_APPROVAL":
     # result.execution.material_intent.fingerprint là nội dung đã trình duyệt
 ```
 
-Cùng `request_key` và intent → replay trả đúng execution đã lưu, kể cả khi host đổi revision mặc định; intent khác với key cũ bị `KEY_MISUSE`. Đọc lại cần quyền `execution.read`; tenant/principal khác không thấy record. `approval_expires_at` do host cung cấp và có hạn mặc định; ngưỡng, role và `self_approval` vẫn thuộc declaration. Approval decision, resume và outbox chưa nằm ở bước này.
+Cùng `request_key` và intent → replay trả đúng execution đã lưu, kể cả khi host đổi revision mặc định; intent khác với key cũ bị `KEY_MISUSE`. Đọc lại cần quyền `execution.read`; tenant/principal khác không thấy record. `approval_expires_at` do host cung cấp và có hạn mặc định; ngưỡng, role và `self_approval` vẫn thuộc declaration. Resume và outbox chưa nằm ở bước này.
+
+## Cửa quyết định duyệt: đúng người, đúng intent, đúng một lần
+
+`approve()` và `reject()` nhận `execution_id`, `callback_key` (`executionId:approvalId`) và `expected_intent_fingerprint` lấy từ `material_intent` đã trình duyệt, cùng một `ApprovalAuthorityProvider` do host cung cấp dữ liệu role/permission/scope/revocation **tại thời điểm gọi**. Engine kiểm khóa đang chờ, khóa callback còn là approval hiện hành, tenant/scope, `self_approval` theo declaration, hạn và thu hồi. Quyền invoke của requester không tự cấp quyền duyệt cho chính người đó.
+
+```python
+result = engine.approve(
+    provider=sqlite_provider,
+    authority_provider=host_authority,
+    principal=approver,
+    execution_id=waiting.execution.execution_id,
+    callback_key=waiting.execution.required_approval.callback_key,
+    expected_intent_fingerprint=waiting.execution.material_intent.fingerprint,
+    reason="budget confirmed",
+)
+```
+
+Decision được ghi dưới khóa callback riêng trong cùng transaction với audit của attempt. Outsider, sai tenant/scope, mất role hoặc permission, tự duyệt bị cấm, approval hết hạn/bị thu hồi hay bị thay đều trả `DENIED` **cho callback đó**: execution vẫn `AWAITING_APPROVAL`, không có decision nào chiếm khóa, và audit ghi attempt bị từ chối tách khỏi lịch sử execution. Cùng khóa với decision/fingerprint/reason đã lưu là replay có kiểm lại authority; đổi payload với khóa cũ là `KEY_MISUSE`. `approve` hợp lệ trả attempt `AWAITING_APPROVAL` kèm `DecisionResult.decision` làm đầu vào cho resume; nó không ghi đơn, ngân sách hay outbox. `reject` hợp lệ trả `REJECTED`, chuyển đúng một lần sang terminal `REJECTED` và không ghi nghiệp vụ; replay sau đó không thêm transition. Provider SQLite dùng hai bảng `approval_decisions` và `approval_audit` cạnh `request_ledger`; xóa hoặc sửa payload decision làm callback fail closed.
+
 
 ## Deployment binding: kiểm tra plan cho `ATOMIC`
 
@@ -560,16 +581,16 @@ Không cần backend: handler chỉ là metadata và không được gọi. Decl
 - **Invoke một handler:** quyền ghi được kiểm live ở cửa engine, ref chỉ có giá trị khi resolve lại dưới grant hiện tại; `ctx.require` tạo `REJECTED`, xung đột version/guard tạo `StalePlan`, lỗi cửa tạo `DENIED` mà không tạo execution. Commit là quyết định của engine sau revalidate, không phải của handler.
 - **Child action đã link:** `calls` và delegation grant được bind trước runtime; `ctx.call` chạy handler của đúng revision đã link với context thu hẹn theo `reads`/`writes` của child, dùng chung một UoW và một transaction. Child `REJECTED`/`DENIED` hủy toàn bộ execution; service identity và ref tự dựng không thay được requester.
 - **Sổ yêu cầu bền vững:** scope key là `tenant / requester / action identity` (ổn định qua rollout version); dấu vân tay intent do engine recompute từ dữ liệu đã canonicalize, không phải digest handler. Key, intent và kết quả `COMMITTED` được ghi trong cùng transaction với mọi business write; replay trả kết quả cũ, còn tra cứu cần quyền đọc execution record. Bản ghi `AWAITING_APPROVAL` chiếm cùng key, kèm manifest đã pin, material intent và required approval; replay trả đúng execution đó.
-- **Chờ ở cửa invoke:** handler chạy trong preview, `approval.when` được đánh giá trên giá trị đã resolve; preview bị hủy trước khi trả `AWAITING_APPROVAL`, nên không có business write hay transaction bị giữ. Dưới ngưỡng đi tiếp đường nguyên tử; `effects` vẫn bị từ chối tường minh.
+- **Tách authority của callback:** requester và approver là hai vai; host cung cấp role/permission/scope/revocation live, engine kiểm khóa, fingerprint, hạn và `self_approval` từ khai báo. Attempt bị từ chối chỉ vào audit, không chiếm khóa và không kết thúc execution; `reject` hợp lệ là terminal duy nhất không ghi nghiệp vụ, còn `approve` chỉ là decision chờ resume.
 - **Consumer mẫu trên adapter thật:** `examples/atomic_approval/` giữ phần caller chỉ ở `query`, `row.as_ref()` và `invoke`; quyền, ngân sách và write nằm trong declaration/handler và engine. Split binding nấc 2 (hai file cùng SQLite) vẫn bị từ chối trước runtime, không hạ xuống saga.
 - Chi tiết và hệ quả cho các task sau: [`docs/official/design/implementation-baseline.md`](docs/official/design/implementation-baseline.md).
 
 ## Giới hạn
 
-- Đây vẫn là lớp mô hình tĩnh, manifest pin local trên graph đã link, deployment binding plan-check, adapter transaction có guarded write, cửa đọc có policy, cửa ghi `invoke()` với child đã link, sổ yêu cầu/kết quả bền vững và trạng thái chờ đã ghi. `examples/atomic_approval/` chỉ là consumer mẫu trên SQLite một file; chưa có publish artifact/registry, approval decision/resume hay effect delivery.
-- Load đã thu thập definition và kiểm tra identity/field; Link đã resolve reference, kiểm tra export/kind và chữ ký handler; snapshot đã công bố graph bất biến với lookup tường minh; `pin_manifest()`/`resolve_manifest()` đã pin và phân giải đúng revision kèm digest artifact; `bind_action()` đã kiểm tra capability, write set và enlistment plan trên snapshot; `waiting` lưu canonical input, material intent và approval dưới key duy nhất, `gate_support` giữ kiểm tra thuần dùng chung, còn `results` tách representation và replay của execution. Adapter transaction thật đã có; chưa có registry bền vững hay publish artifact.
-- Predicate approval được đánh giá có cấu trúc tại cửa `invoke` cho nhánh chờ, kèm fingerprint của material intent; callback duyệt, resume và giao effect chưa có. `Function` dùng cùng quy ước `handler(self, ctx, ...)` với `Action` theo implementation baseline.
-- Bằng chứng invoke chỉ phủ handler đơn, một child đã link và sổ yêu cầu/kết quả trên adapter SQLite đã bind: từ chối quyền/scope/type/ref cũ, `REJECTED`, guard stale, ghi ngoài declaration, child sai revision/quyền/scope, key trùng intent khác, race cùng key và hai đơn tranh một budget, split binding và replay sau mất phản hồi; phần chờ kiểm ngưỡng dưới/tại/trên, precondition rớt, replay sau mở lại engine và đổi revision mặc định, connection khác ghi được lúc chờ, không có write đơn/ngân sách/outbox và phân quyền tenant/đọc. Không có tuyên bố về publish artifact, approval decision/resume, effect delivery, PostgreSQL/ERP, mọi lịch trình interleaving hay sandbox handler trong-process.
+- Đây vẫn là lớp mô hình tĩnh, manifest pin local trên graph đã link, deployment binding plan-check, adapter transaction có guarded write, cửa đọc có policy, cửa ghi `invoke()` với child đã link, sổ yêu cầu/kết quả bền vững, trạng thái chờ và cửa quyết định đã ghi. `examples/atomic_approval/` chỉ là consumer mẫu trên SQLite một file; chưa có publish artifact/registry, resume hay effect delivery.
+- Load đã thu thập definition và kiểm tra identity/field; Link đã resolve reference, kiểm tra export/kind và chữ ký handler; snapshot đã công bố graph bất biến với lookup tường minh; `pin_manifest()`/`resolve_manifest()` đã pin và phân giải đúng revision kèm digest artifact; `bind_action()` đã kiểm tra capability, write set và enlistment plan trên snapshot; `waiting` lưu canonical input, material intent và approval dưới key duy nhất, `decision` giữ callback key, authority live và audit attempt, `gate_support` giữ kiểm tra thuần dùng chung, còn `results` tách representation và replay của execution. Adapter transaction thật đã có; chưa có registry bền vững hay publish artifact.
+- Predicate approval được đánh giá có cấu trúc tại cửa `invoke` cho nhánh chờ, kèm fingerprint của material intent; callback duyệt đã có cửa riêng với audit và idempotency, còn resume và giao effect chưa có. `Function` dùng cùng quy ước `handler(self, ctx, ...)` với `Action` theo implementation baseline.
+- Bằng chứng invoke và callback chỉ phủ handler đơn, một child đã link và sổ yêu cầu/kết quả trên adapter SQLite đã bind: từ chối quyền/scope/type/ref cũ, `REJECTED`, guard stale, ghi ngoài declaration, child sai revision/quyền/scope, key trùng intent khác, race cùng key và hai đơn tranh một budget, split binding và replay sau mất phản hồi; phần chờ kiểm ngưỡng dưới/tại/trên, precondition rớt, replay sau mở lại engine và đổi revision mặc định, connection khác ghi được lúc chờ, không có write đơn/ngân sách/outbox và phân quyền tenant/đọc; phần quyết định kiểm outsider, sai tenant/scope/key/fingerprint, mất role/quyền, tự duyệt theo declaration, hết hạn/thu hồi/thay approval, replay có kiểm quyền, `KEY_MISUSE` và reject terminal một lần không ghi nghiệp vụ. Không có tuyên bố về publish artifact, resume, effect delivery, PostgreSQL/ERP, mọi lịch trình interleaving hay sandbox handler trong-process.
 - Static validation không phát hiện truy cập ẩn trong thân handler (import lén, `getattr` động, đọc file/socket). Binding chỉ kiểm tra mapping khai báo; nó không phát hiện host code tự mở connection hoặc dùng credential ambient ngoài plan và không sandbox handler. Đó là rủi ro đã ghi nhận, xử lý bằng review và test.
 
 ## Tài liệu

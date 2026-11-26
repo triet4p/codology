@@ -26,6 +26,8 @@
 - Added a runnable consumer example at `examples/atomic_approval/`: it reads a pending purchase order through `query`, takes `VersionedRef[PurchaseOrder]` from `row.as_ref()`, and invokes the tier-2 approval action against a file-backed SQLite adapter. The order approval and the Finance budget reservation commit in one physical transaction, with replay, refusal, split-binding and rollback paths documented and reported by the entry point.
 - Added end-to-end integration tests for the executable example: one commit with matching workflow state and ledger row, read and invoke denials that leave the database unchanged, split binding rejected before any write, rollback after a partial write, two orders contending for one budget with exactly one commit, and replay after a lost response.
 
+- Added an approval decision gate: `engine.approve()` and `engine.reject()` bind each callback to the current approval's key and material-intent fingerprint, check live approver role/permission, tenant, scope, `self_approval`, expiry and revocation supplied by the host, and record accepted decisions with a separate audit of every attempt. Replay under the same key rechecks authority, changed payloads are `KEY_MISUSE`, denied attempts do not claim the key, a valid reject ends once in `REJECTED` without business writes, and a valid approve is an input to resume rather than a commit.
+
 ### Fixed
 
 - Fixed `invoke()` leaving the request-key transaction open when it returned a stored replay result; the unit is now rolled back and closed, so a later writer is not blocked by a leaked `BEGIN IMMEDIATE`.
