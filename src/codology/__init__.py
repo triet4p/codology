@@ -35,6 +35,13 @@ from codology.binding import (
     UnknownProvider,
     bind_action,
 )
+from codology.ledger import (
+    EXECUTION_READ_PERMISSION,
+    DuplicateRequest,
+    LedgerEntry,
+    LedgerProvider,
+    RequestScope,
+)
 from codology.linking import (
     HandlerMismatch,
     LinkedDeclarations,
@@ -190,6 +197,11 @@ __all__ = [
     "SecureQueryProvider",
     "UnsupportedSecureQuery",
     "VersionedRef",
+    "DuplicateRequest",
+    "EXECUTION_READ_PERMISSION",
+    "LedgerEntry",
+    "LedgerProvider",
+    "RequestScope",
     "query",
     "__version__",
     "bind_action",

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from codology.binding import SessionPlan
+from codology.ledger import DuplicateRequest, LedgerEntry, RequestScope
 from codology.money import MinorMoney
 from codology.ports import (
     ApplyResult,
@@ -43,6 +44,37 @@ _COMPARE_SQL: dict[CompareOp, str] = {
     "<": "<",
     "<=": "<=",
 }
+
+_LEDGER_COLUMNS = (
+    "tenant",
+    "principal",
+    "action",
+    "request_key",
+    "intent_fingerprint",
+    "execution_id",
+    "action_version",
+    "status",
+    "payload",
+)
+_LEDGER_SELECT = ("intent_fingerprint", "execution_id", "action_version", "status", "payload")
+
+
+def _stored_entry(
+    scope: RequestScope,
+    request_key: str,
+    row: Sequence[object],
+) -> LedgerEntry | None:
+    if row[3] != "COMMITTED":
+        return None
+    return LedgerEntry(
+        scope,
+        request_key,
+        str(row[0]),
+        str(row[1]),
+        str(row[2]),
+        "COMMITTED",
+        str(row[4]),
+    )
 
 
 class UnknownResource(ValueError):
@@ -162,10 +194,12 @@ class SQLiteUnitOfWork:
         connection: sqlite3.Connection,
         transaction: str,
         resources: Mapping[str, ResourceBinding],
+        ledger_table: str,
     ) -> None:
         self._connection = connection
         self._transaction = transaction
         self._resources = resources
+        self._ledger_table = ledger_table
         self._closed = False
 
     @property
@@ -227,6 +261,43 @@ class SQLiteUnitOfWork:
             )
         return result
 
+    def lookup(self, scope: RequestScope, request_key: str) -> LedgerEntry | None:
+        """Read a committed entry on the same transaction that will claim it."""
+        self._require_open()
+        statement = (
+            f"SELECT {', '.join(_LEDGER_SELECT)} FROM {self._ledger_table} "
+            "WHERE tenant = ? AND principal = ? AND action = ? AND request_key = ?"
+        )
+        found = self._connection.execute(
+            statement, (scope.tenant, scope.principal, scope.action, request_key)
+        ).fetchone()
+        return None if found is None else _stored_entry(scope, request_key, found)
+
+    def record(self, entry: LedgerEntry) -> None:
+        """Claim the scoped key in this transaction, beside the business writes."""
+        self._require_open()
+        statement = (
+            f"INSERT INTO {self._ledger_table} ({', '.join(_LEDGER_COLUMNS)}) "
+            f"VALUES ({', '.join('?' for _ in _LEDGER_COLUMNS)})"
+        )
+        values = (
+            entry.scope.tenant,
+            entry.scope.principal,
+            entry.scope.action,
+            entry.request_key,
+            entry.intent_fingerprint,
+            entry.execution_id,
+            entry.action_version,
+            entry.status,
+            entry.payload,
+        )
+        try:
+            self._connection.execute(statement, values)
+        except sqlite3.IntegrityError as exc:
+            raise DuplicateRequest(
+                f"request key {entry.request_key!r} is already claimed."
+            ) from exc
+
     def commit(self) -> None:
         self._require_open()
         self._connection.commit()
@@ -254,9 +325,11 @@ class SQLiteProvider:
         database: str | Path,
         session: str,
         resources: Sequence[ResourceBinding],
+        ledger_table: str = "request_ledger",
     ) -> None:
         self.database = Path(database)
         self.session = _require_text(session, "session")
+        self.ledger_table = _identifier(ledger_table, "ledger_table")
         bindings = tuple(resources)
         self.resources: dict[str, ResourceBinding] = {}
         for binding in bindings:
@@ -282,7 +355,19 @@ class SQLiteProvider:
             connection.close()
             raise
         transaction = f"{self.session}#{id(connection):x}"
-        return SQLiteUnitOfWork(connection, transaction, self.resources)
+        return SQLiteUnitOfWork(connection, transaction, self.resources, self.ledger_table)
+
+    def lookup(self, scope: RequestScope, request_key: str) -> LedgerEntry | None:
+        """Read a committed result through a fresh, read-only connection."""
+        statement = (
+            f"SELECT {', '.join(_LEDGER_SELECT)} FROM {self.ledger_table} "
+            "WHERE tenant = ? AND principal = ? AND action = ? AND request_key = ?"
+        )
+        parameters = (scope.tenant, scope.principal, scope.action, request_key)
+        with closing(sqlite3.connect(self.database, timeout=10.0, isolation_level=None)) as conn:
+            conn.execute("PRAGMA query_only = ON")
+            found = conn.execute(statement, parameters).fetchone()
+        return None if found is None else _stored_entry(scope, request_key, found)
 
     def fetch(self, request: QueryRequest) -> QueryPage[object]:
         """Answer one authorized query with a single policy-filtered read."""
