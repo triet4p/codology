@@ -176,9 +176,10 @@ def _provider(path: Path) -> SQLiteProvider:
         path,
         _SESSION,
         (
-            ResourceBinding(_BUDGET, "budgets", ("balance",), currency=_CURRENCY),
+            ResourceBinding(_BUDGET, "1.0.0", "budgets", ("balance",), currency=_CURRENCY),
             ResourceBinding(
                 _ORDER,
+                "1.0.0",
                 "purchase_orders",
                 ("status", "approved_amount"),
                 currency=_CURRENCY,
@@ -244,8 +245,7 @@ def _state(
                 int(version),
             )
             for order_id, status, approved, version in connection.execute(
-                "SELECT id, status, approved_amount, version "
-                "FROM purchase_orders ORDER BY id"
+                "SELECT id, status, approved_amount, version FROM purchase_orders ORDER BY id"
             ).fetchall()
         }
         return budget, orders
@@ -324,14 +324,25 @@ def test_failure_after_first_write_rolls_back_cleanly(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("case", "writes", "order_status", "expected_resource"),
     [
-        ("stale budget version", (_budget_write(version=2), _order_write()),
-         "PENDING_APPROVAL", _BUDGET),
-        ("insufficient budget", (_budget_write(_amount("120000")), _order_write()),
-         "PENDING_APPROVAL", _BUDGET),
-        ("order not pending", (_budget_write(), _order_write()),
-         "CANCELLED", _ORDER),
-        ("stale order version", (_budget_write(), _order_write(version=2)),
-         "PENDING_APPROVAL", _ORDER),
+        (
+            "stale budget version",
+            (_budget_write(version=2), _order_write()),
+            "PENDING_APPROVAL",
+            _BUDGET,
+        ),
+        (
+            "insufficient budget",
+            (_budget_write(_amount("120000")), _order_write()),
+            "PENDING_APPROVAL",
+            _BUDGET,
+        ),
+        ("order not pending", (_budget_write(), _order_write()), "CANCELLED", _ORDER),
+        (
+            "stale order version",
+            (_budget_write(), _order_write(version=2)),
+            "PENDING_APPROVAL",
+            _ORDER,
+        ),
     ],
 )
 def test_guard_conflicts_never_overwrite(
@@ -385,9 +396,7 @@ def test_controlled_two_connection_budget_contention(tmp_path: Path) -> None:
         except StalePlan as error:
             outcomes["B"] = error
 
-    threads = [
-        threading.Thread(target=run, args=(order_id,)) for order_id in ("PO-A", "PO-B")
-    ]
+    threads = [threading.Thread(target=run, args=(order_id,)) for order_id in ("PO-A", "PO-B")]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -418,9 +427,7 @@ def test_write_outside_bound_plan_is_refused(tmp_path: Path) -> None:
     before = _state(path)
 
     with pytest.raises(UnboundWriteAttempt):
-        commit_guarded_writes(
-            _provider(path), replace(_plan(), writes=()), (_budget_write(),)
-        )
+        commit_guarded_writes(_provider(path), replace(_plan(), writes=()), (_budget_write(),))
     assert _state(path) == before
 
 

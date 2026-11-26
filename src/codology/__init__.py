@@ -1,12 +1,12 @@
 """Codology's import root.
 
 The package ships the static declaration layer, Load, Link, an immutable
-snapshot view, deployment binding, and core ports for physical transactions.
-Binding validates a deployment plan without calling a handler or opening a
-transaction; the commit boundary and exact money value live in the core.
-Adapter implementations are separate modules and are never imported here.
-Importing ``codology`` must never require a database, credentials, or a
-backend SDK.
+snapshot view, deployment binding, core ports for physical transactions, and
+an authorized query boundary. Binding validates a deployment plan without
+calling a handler or opening a transaction; the commit boundary, exact money
+value and read policy live in the core. Adapter implementations are separate
+modules and are never imported here. Importing ``codology`` must never
+require a database, credentials, or a backend SDK.
 """
 
 from codology.binding import (
@@ -67,6 +67,25 @@ from codology.ports import (
     StalePlan,
     TransactionProvider,
     UnitOfWork,
+)
+from codology.query import (
+    AllOf,
+    Comparison,
+    CursorPosition,
+    InvalidCursor,
+    LinkBinding,
+    OrderBy,
+    Principal,
+    QueryPage,
+    QueryPredicate,
+    QueryRequest,
+    QueryRow,
+    ReadDenied,
+    ReadGrant,
+    SecureQueryProvider,
+    UnsupportedSecureQuery,
+    VersionedRef,
+    query,
 )
 from codology.snapshot import (
     AllOfExpr,
@@ -151,6 +170,23 @@ __all__ = [
     "UnknownDefinition",
     "UnknownProvider",
     "WrongKind",
+    "AllOf",
+    "Comparison",
+    "CursorPosition",
+    "InvalidCursor",
+    "LinkBinding",
+    "OrderBy",
+    "Principal",
+    "QueryPage",
+    "QueryRequest",
+    "QueryPredicate",
+    "QueryRow",
+    "ReadDenied",
+    "ReadGrant",
+    "SecureQueryProvider",
+    "UnsupportedSecureQuery",
+    "VersionedRef",
+    "query",
     "__version__",
     "bind_action",
     "commit_guarded_writes",

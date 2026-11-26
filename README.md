@@ -4,7 +4,7 @@ Codology (Ontology as Code) là lớp mô hình tĩnh cho phép developer khai b
 
 ## Trạng thái
 
-Repository đang ở Sprint 4 — Lát cắt thực thi nguyên tử. Phần đã có là project scaffold, hạ tầng khai báo tĩnh, deployment binding ở mức plan và adapter SQLite cho transaction vật lý với guarded write:
+Repository đang ở Sprint 4 — Lát cắt thực thi nguyên tử. Phần đã có là project scaffold, hạ tầng khai báo tĩnh, deployment binding ở mức plan, adapter SQLite cho transaction vật lý với guarded write và cửa đọc `query` có policy:
 
 - `codology` import được từ môi trường sạch, không cần database, credential hay backend SDK.
 - `codology.declarations` cung cấp primitive cấu trúc bất biến `Module`, `ObjectType`, `Value`, `Link` và `ObjectRef[T]`: identity/version tường minh, property có kiểu, link có target/cardinality/traversal và `exports` đóng băng.
@@ -13,7 +13,7 @@ Repository đang ở Sprint 4 — Lát cắt thực thi nguyên tử. Phần đ�
 - Ví dụ Procurement/Finance chạy được trên API thật (`examples/procurement_finance/`) cùng kiểm thử tích hợp và kiểm tra typing cho cả đường thành công lẫn lỗi tĩnh.
 - `bind_action()` kiểm tra deployment plan cho action `ATOMIC`: capability của provider, write set bắc cầu qua `calls`, một session enlist chung và mapping ủy quyền không rộng hơn contract; không gọi handler và không mở transaction.
 - `codology.adapter` mở đúng một transaction SQLite vật lý cho mọi write đã bind; `commit_guarded_writes()` là biên commit do engine/port sở hữu, rollback sạch trước commit và chỉ coi `rowcount == 1` là thành công. Tiền được biểu diễn bằng số nguyên đơn vị nhỏ (`MinorMoney`) với một currency cố định, không FX.
-- Engine `query`/`invoke`, authorization runtime, sổ yêu cầu bền vững và publish artifact **chưa được triển khai**; các task sau trong sprint bổ sung dần.
+- Cửa `engine.query` (hàm `query()`) authorize principal/grant trước khi đọc, chỉ nhận predicate có pushdown đã kiểm chứng, áp tenant/scope ở adapter trước phân trang/count và phát hành ref có type/version từ row. `invoke`, HandlerCtx, sổ yêu cầu bền vững và publish artifact **chưa được triển khai**; các task sau trong sprint bổ sung dần.
 
 ## Yêu cầu
 
@@ -52,6 +52,7 @@ src/codology/
   money.py          # MinorMoney: số nguyên đơn vị nhỏ, một currency
   ports.py          # Port lõi: guarded write, transaction, kết quả apply
   uow.py            # Biên commit do engine/port sở hữu
+  query.py          # Đọc có policy: authorize, pushdown, cursor, count, typed ref
   adapter.py        # Adapter SQLite: một session, một transaction vật lý
   declarations/
     __init__.py
@@ -302,9 +303,9 @@ provider = SQLiteProvider(
     "orders.sqlite3",
     "sqlite:main",
     (
-        ResourceBinding("finance.budget", "budgets", ("balance",), currency="VND"),
+        ResourceBinding("finance.budget", "1.0.0", "budgets", ("balance",), currency="VND"),
         ResourceBinding(
-            "procurement.purchase_order", "purchase_orders",
+            "procurement.purchase_order", "1.0.0", "purchase_orders",
             ("status", "approved_amount"), currency="VND",
         ),
     ),
@@ -335,6 +336,52 @@ Mỗi guarded write gồm `expected_version`, phép gán và điều kiện; ada
 
 Đây là bằng chứng cơ chế trên SQLite file và **một** interleaving có điều khiển, không phải chứng minh mọi lịch chạy hay hành vi PostgreSQL/ERP. Session được xác nhận lúc mở transaction (`SessionMismatch` nếu plan trỏ session khác); ledger, authorize và handler vẫn thuộc task sau.
 
+## Đọc có policy và typed ref
+
+`query()` là cửa đọc duy nhất: kiểm grant của principal, từ chối predicate không có pushdown đã kiểm chứng, rồi giao cho adapter áp tenant/scope trong cùng `WHERE` dùng cho rows và count. Cursor là token mờ gắn với definition, grant, predicate và sort; dùng lại cursor ở tenant/key/intent khác bị từ chối. Order bằng một cột tường minh và luôn có khóa làm tie-break, nên phân trang ổn định. Không có `list_raw`, `count_unfiltered` hay đường đọc trực tiếp bỏ qua cửa này.
+
+```python
+from codology import (
+    Comparison,
+    DefinitionKey,
+    OrderBy,
+    Principal,
+    ReadGrant,
+    query,
+)
+from codology.adapter import ResourceBinding, SQLiteProvider
+from examples.procurement_finance.procurement import PurchaseOrder
+
+definition = DefinitionKey("procurement.purchase_order", "1.0.0")
+provider = SQLiteProvider(
+    "orders.sqlite3",
+    "sqlite:main",
+    (
+        ResourceBinding(
+            "procurement.purchase_order", "1.0.0", "purchase_orders",
+            ("status", "approved_amount"),
+            tenant_column="tenant", scope_column="scope",
+        ),
+    ),
+)
+principal = Principal("alice", "tenant-a", frozenset({"purchase_order.read"}))
+grant = ReadGrant("alice", definition, "tenant-a", ("team-1",), "purchase_order.read")
+page = query(
+    provider=provider,
+    principal=principal,
+    grant=grant,
+    from_=definition,
+    target=PurchaseOrder,
+    order=OrderBy("created_at"),
+    predicate=Comparison("status", "==", "PENDING_APPROVAL"),
+    limit=20,
+    count_requested=True,
+)
+ref = page.rows[0].as_ref()  # VersionedRef[PurchaseOrder]: identity, version, instance_version
+```
+
+Tập được hỗ trợ trong adapter đầu: so sánh `==`, `!=`, `>`, `>=`, `<`, `<=` trên cột đã map và `all_of` của các so sánh đó; giá trị là `str`, `int`, `None` hoặc `MinorMoney`. Không hỗ trợ traversal (kể cả cạnh `internal`), predicate tổng quát, arithmetic hay postfilter không biên: mọi ca đó trả `UnsupportedSecureQuery` mà không trả row hay count. Đây là pushdown trung thực trên SQLite; chưa có nhánh bounded evaluation phía engine, chưa phải bằng chứng cho provider khác.
+
 ## Ví dụ Procurement/Finance
 
 `examples/procurement_finance/` là ví dụ chạy được trên chính API công khai ở trên: hai module Procurement và Finance, `ApprovePurchaseOrder` gọi `finance.reserve_budget`, kèm approval và effect metadata. Chạy từ gốc repo:
@@ -353,14 +400,15 @@ Không cần backend: handler chỉ là metadata và không được gọi. Hư�
 - **Forward reference không import vòng:** annotation được giữ nguyên dạng viết lúc tạo class và chỉ resolve ở pha Link bằng namespace đã compose từ mọi module tham gia link. Hai module có thể tham chiếu kiểu của nhau mà không import nhau lúc chạy.
 - **Layout và công cụ:** source đặt trong `src/codology/`, đóng gói bằng Hatchling, quản lý bằng uv; kiểm thử bằng pytest; type-check bằng Pyright strict; lint/format bằng Ruff.
 - **Adapter và tiền chính xác:** SQLite file-backed, một session vật lý cho mọi write đã bind; `MinorMoney` lưu số nguyên đơn vị nhỏ với một currency, không float và không FX.
+- **Đọc an toàn:** mọi row/count/cursor đi qua một cửa đã authorize; adapter SQLite chỉ nhận predicate có pushdown tương đương đã kiểm chứng, từ chối traversal `internal` và mọi traversal chưa có conformance thay vì lọc ngầm sau khi đọc.
 - Chi tiết và hệ quả cho các task sau: [`docs/official/design/implementation-baseline.md`](docs/official/design/implementation-baseline.md).
 
 ## Giới hạn
 
-- Đây vẫn là lớp mô hình tĩnh, deployment binding plan-check và adapter transaction có guarded write. Chưa có engine `query`/`invoke`, authorization, UoW cho handler, sổ yêu cầu/kết quả hay effect delivery.
+- Đây vẫn là lớp mô hình tĩnh, deployment binding plan-check, adapter transaction có guarded write và cửa đọc có policy. Chưa có `invoke`, HandlerCtx cho handler, UoW scoped cho handler, sổ yêu cầu/kết quả hay effect delivery.
 - Load đã thu thập definition và kiểm tra identity/field; Link đã resolve reference, kiểm tra export/kind và chữ ký handler; snapshot đã công bố graph bất biến với lookup tường minh; `bind_action()` đã kiểm tra capability, write set và enlistment plan trên snapshot. Adapter transaction thật đã có; registry bền vững và publish artifact thuộc các task kế tiếp.
 - Predicate approval chỉ được lưu dạng cấu trúc; chưa có đánh giá ngưỡng, callback duyệt hay giao effect. `Function` dùng cùng quy ước `handler(self, ctx, ...)` với `Action` theo implementation baseline.
-- Không có tuyên bố engine `query`/`invoke`, authorization hay execution đã hoạt động. Adapter chứng minh một transaction vật lý và guard trên SQLite; binding vẫn chỉ là plan-check, không thay cho runtime proof trên backend khác. Bằng chứng chỉ phủ các interleaving đã kiểm (rollback, guard, tranh chấp hai connection), không phải mọi lịch chạy, PostgreSQL/ERP hay mất phản hồi sau commit (sổ kết quả thuộc task sau).
+- Không có tuyên bố engine `invoke`, authorization ghi hay execution đã hoạt động. Adapter chứng minh một transaction vật lý và guard trên SQLite; cửa đọc chứng minh policy trước phân trang/count trên adapter đó. Bằng chứng chỉ phủ các interleaving đã kiểm (rollback, guard, tranh chấp hai connection, phân trang có cursor), không phải mọi lịch chạy, PostgreSQL/ERP hay mất phản hồi sau commit (sổ kết quả thuộc task sau).
 - Static validation không phát hiện truy cập ẩn trong thân handler (import lén, `getattr` động, đọc file/socket). Binding chỉ kiểm tra mapping khai báo; nó không phát hiện host code tự mở connection hoặc dùng credential ambient ngoài plan và không sandbox handler. Đó là rủi ro đã ghi nhận, xử lý bằng review và test.
 
 ## Tài liệu
