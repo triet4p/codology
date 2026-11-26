@@ -12,6 +12,13 @@ from pathlib import Path
 from typing import cast
 
 from codology.binding import SessionPlan
+from codology.decision import (
+    DecisionAttempt,
+    DecisionRecord,
+    ExecutionSnapshot,
+    encode_principal,
+    stored_decision,
+)
 from codology.ledger import DuplicateRequest, LedgerEntry, RequestScope
 from codology.money import MinorMoney
 from codology.ports import (
@@ -38,6 +45,7 @@ from codology.query import (
     is_issued_ref,
     issue_cursor,
 )
+from codology.waiting import encode_approval
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _COMPARE_SQL: dict[CompareOp, str] = {
@@ -62,6 +70,30 @@ _LEDGER_COLUMNS = (
 )
 _LEDGER_SELECT = ("intent_fingerprint", "execution_id", "action_version", "status", "payload")
 
+_DECISION_COLUMNS = (
+    "callback_key",
+    "execution_id",
+    "approval_id",
+    "decision",
+    "intent_fingerprint",
+    "reason",
+    "principal",
+    "approval",
+    "authority_revision",
+    "recorded_at",
+)
+_AUDIT_COLUMNS = (
+    "attempt_id",
+    "callback_key",
+    "execution_id",
+    "principal",
+    "code",
+    "detail",
+    "decision",
+    "intent_fingerprint",
+    "recorded_at",
+)
+
 
 def _stored_entry(
     scope: RequestScope,
@@ -69,7 +101,7 @@ def _stored_entry(
     row: Sequence[object],
 ) -> LedgerEntry | None:
     status = str(row[3])
-    if status not in ("COMMITTED", "AWAITING_APPROVAL"):
+    if status not in ("COMMITTED", "AWAITING_APPROVAL", "REJECTED"):
         return None
     return LedgerEntry(
         scope,
@@ -341,6 +373,155 @@ class SQLiteUnitOfWork:
             self._transaction_ended = True
 
 
+class SQLiteDecisionUnit:
+    """One transaction that claims a callback key and audits its attempt."""
+
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        ledger_table: str,
+        decision_table: str,
+        audit_table: str,
+    ) -> None:
+        self._connection = connection
+        self._ledger_table = ledger_table
+        self._decision_table = decision_table
+        self._audit_table = audit_table
+        self._transaction_ended = False
+        self._connection_closed = False
+
+    def _require_open(self) -> None:
+        if self._transaction_ended or self._connection_closed:
+            raise RuntimeError("the decision unit is closed.")
+
+    def find_decision(self, callback_key: str) -> DecisionRecord | None:
+        """Read the stored decision under its exact callback key."""
+        self._require_open()
+        statement = (
+            f"SELECT {', '.join(_DECISION_COLUMNS)} FROM {self._decision_table} "
+            "WHERE callback_key = ?"
+        )
+        try:
+            found = self._connection.execute(statement, (callback_key,)).fetchone()
+        except sqlite3.OperationalError as exc:
+            raise TransactionUnavailable(f"decision lookup failed: {exc}") from exc
+        if found is None:
+            return None
+        return stored_decision(dict(zip(_DECISION_COLUMNS, found, strict=True)))
+
+    def find_execution(self, execution_id: str) -> ExecutionSnapshot | None:
+        """Resolve one execution through its durable id, never a caller guess."""
+        self._require_open()
+        statement = (
+            f"SELECT tenant, principal, action, request_key, {', '.join(_LEDGER_SELECT)} "
+            f"FROM {self._ledger_table} WHERE execution_id = ? LIMIT 2"
+        )
+        try:
+            found = self._connection.execute(statement, (execution_id,)).fetchall()
+        except sqlite3.OperationalError as exc:
+            raise TransactionUnavailable(f"execution lookup failed: {exc}") from exc
+        if len(found) != 1:
+            return None
+        row = found[0]
+        return ExecutionSnapshot(
+            RequestScope(str(row[0]), str(row[1]), str(row[2])),
+            str(row[3]),
+            str(row[4]),
+            str(row[5]),
+            str(row[6]),
+            str(row[7]),
+            str(row[8]),
+        )
+
+    def record_decision(self, record: DecisionRecord) -> bool:
+        """Claim one callback key; a second claimant reports the conflicting key."""
+        self._require_open()
+        statement = (
+            f"INSERT OR IGNORE INTO {self._decision_table} "
+            f"({', '.join(_DECISION_COLUMNS)}) "
+            f"VALUES ({', '.join('?' for _ in _DECISION_COLUMNS)})"
+        )
+        values = (
+            record.callback_key,
+            record.execution_id,
+            record.approval_id,
+            record.decision,
+            record.intent_fingerprint,
+            record.reason,
+            encode_principal(record.principal),
+            encode_approval(record.approval),
+            record.authority_revision,
+            record.recorded_at,
+        )
+        try:
+            cursor = self._connection.execute(statement, values)
+        except sqlite3.OperationalError as exc:
+            raise TransactionUnavailable(f"decision claim failed: {exc}") from exc
+        return cursor.rowcount == 1
+
+    def record_attempt(self, attempt: DecisionAttempt) -> None:
+        """Audit one callback attempt apart from execution transitions."""
+        self._require_open()
+        statement = (
+            f"INSERT INTO {self._audit_table} ({', '.join(_AUDIT_COLUMNS)}) "
+            f"VALUES ({', '.join('?' for _ in _AUDIT_COLUMNS)})"
+        )
+        values = (
+            attempt.attempt_id,
+            attempt.callback_key,
+            attempt.execution_id,
+            encode_principal(attempt.principal),
+            attempt.code,
+            attempt.detail,
+            attempt.decision,
+            attempt.intent_fingerprint,
+            attempt.recorded_at,
+        )
+        try:
+            self._connection.execute(statement, values)
+        except sqlite3.OperationalError as exc:
+            raise TransactionUnavailable(f"decision audit failed: {exc}") from exc
+
+    def transition_rejected(self, execution_id: str) -> bool:
+        """Guard the terminal transition; a second reject changes no row."""
+        self._require_open()
+        statement = (
+            f"UPDATE {self._ledger_table} SET status = 'REJECTED' "
+            "WHERE execution_id = ? AND status = 'AWAITING_APPROVAL'"
+        )
+        try:
+            cursor = self._connection.execute(statement, (execution_id,))
+        except sqlite3.OperationalError as exc:
+            raise TransactionUnavailable(f"reject transition failed: {exc}") from exc
+        return cursor.rowcount == 1
+
+    def commit(self) -> None:
+        self._require_open()
+        try:
+            self._connection.commit()
+        except sqlite3.OperationalError as exc:
+            raise CommitOutcomeUnknown(f"the decision commit was not confirmed: {exc}") from exc
+        self._transaction_ended = True
+
+    def rollback(self) -> None:
+        if self._transaction_ended or self._connection_closed:
+            return
+        try:
+            if self._connection.in_transaction:
+                self._connection.rollback()
+        finally:
+            self._transaction_ended = True
+
+    def close(self) -> None:
+        if self._connection_closed:
+            return
+        try:
+            self._connection.close()
+        finally:
+            self._connection_closed = True
+            self._transaction_ended = True
+
+
 class SQLiteProvider:
     """Opens the bound session as one file-backed SQLite transaction."""
 
@@ -350,11 +531,15 @@ class SQLiteProvider:
         session: str,
         resources: Sequence[ResourceBinding],
         ledger_table: str = "request_ledger",
+        decision_table: str = "approval_decisions",
+        audit_table: str = "approval_audit",
         timeout: float = 10.0,
     ) -> None:
         self.database = Path(database)
         self.session = _require_text(session, "session")
         self.ledger_table = _identifier(ledger_table, "ledger_table")
+        self.decision_table = _identifier(decision_table, "decision_table")
+        self.audit_table = _identifier(audit_table, "audit_table")
         timeout_value = cast(object, timeout)
         if isinstance(timeout_value, bool) or not isinstance(timeout_value, int | float):
             raise TypeError("timeout must be a number of seconds.")
@@ -411,6 +596,25 @@ class SQLiteProvider:
             conn.execute("PRAGMA query_only = ON")
             found = conn.execute(statement, parameters).fetchone()
         return None if found is None else _stored_entry(scope, request_key, found)
+
+    def decision_unit(self) -> SQLiteDecisionUnit:
+        """Open one write transaction for callback decisions and attempt audit."""
+        try:
+            connection = sqlite3.connect(self.database, timeout=self.timeout, isolation_level=None)
+        except sqlite3.OperationalError as exc:
+            raise TransactionUnavailable(f"could not open the decision session: {exc}") from exc
+        try:
+            connection.execute(f"PRAGMA busy_timeout = {round(self.timeout * 1000)}")
+            connection.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            connection.close()
+            raise TransactionUnavailable(f"could not start the decision unit: {exc}") from exc
+        except BaseException:
+            connection.close()
+            raise
+        return SQLiteDecisionUnit(
+            connection, self.ledger_table, self.decision_table, self.audit_table
+        )
 
     def fetch(self, request: QueryRequest) -> QueryPage[object]:
         """Answer one authorized query with a single policy-filtered read."""
@@ -571,6 +775,7 @@ __all__ = [
     "InvalidColumn",
     "ResourceBinding",
     "SQLiteProvider",
+    "SQLiteDecisionUnit",
     "SQLiteUnitOfWork",
     "UnknownResource",
 ]
