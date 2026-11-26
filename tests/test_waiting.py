@@ -419,6 +419,7 @@ def test_pending_survives_engine_reopen_and_replay(tmp_path: Path) -> None:
     first = _invoke(path, _parameters(path))
     assert first.attempt.code == "AWAITING_APPROVAL"
     assert first.execution is not None
+    assert first.execution.deduplicated is False
 
     second = _invoke(path, _parameters(path))
     assert second.attempt.code == "AWAITING_APPROVAL"

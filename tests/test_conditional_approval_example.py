@@ -143,6 +143,7 @@ def test_restart_and_new_default_replay_keep_the_pinned_execution(tmp_path: Path
     path, host = _host(tmp_path, "pin.sqlite3", amount=120_000)
     first = _invoke(host)
     assert first.execution is not None and first.execution.required_approval is not None
+    assert first.execution.deduplicated is False
 
     reopened = wiring.open_host(path)
     replay = _replay(reopened)
@@ -150,6 +151,7 @@ def test_restart_and_new_default_replay_keep_the_pinned_execution(tmp_path: Path
     assert replay.execution is not None
     assert replay.execution.execution_id == first.execution.execution_id
     assert replay.execution.pinned_manifest == first.execution.pinned_manifest
+    assert replay.execution.deduplicated is True
     assert _rows(path, "SELECT COUNT(*) FROM request_ledger") == [(1,)]
 
     _approve(reopened, first)

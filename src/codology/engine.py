@@ -518,7 +518,7 @@ def invoke(
                         awaiting.requester,
                         (),
                         intent.child_keys,
-                        True,
+                        False,
                         awaiting.pinned_manifest,
                         intent,
                         awaiting.required_approval,

@@ -35,6 +35,7 @@
 
 ### Fixed
 
+- Fixed the first `AWAITING_APPROVAL` result from `invoke()` reporting `deduplicated=True`; a newly created approval request now reports `False`, while a replay of the same request key still reports `True`.
 - Fixed `invoke()` leaving the request-key transaction open when it returned a stored replay result; the unit is now rolled back and closed, so a later writer is not blocked by a leaked `BEGIN IMMEDIATE`.
 - Fixed runtime transaction failures escaping `invoke()` as raw exceptions: a provider that does not host the bound session, a write lock that cannot be acquired within the adapter timeout, and an unconfirmed commit now return `UNKNOWN` with no execution record. The engine does not claim a rollback it cannot prove; callers reconcile before retrying.
 - Fixed the SQLite unit of work leaving its connection open after `commit()`/`rollback()`; `close()` now releases the connection deterministically and remains idempotent. `SQLiteProvider` also accepts a `timeout` in seconds for lock acquisition.
