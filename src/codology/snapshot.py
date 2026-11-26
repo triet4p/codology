@@ -195,7 +195,7 @@ def _entry(item: LinkedDefinition, identity: str, version: str) -> SnapshotEntry
         identity=identity,
         version=version,
         owner=item.definition.owner,
-        kind=_kind(declaration),
+        kind=definition_kind(declaration),
         dependencies=tuple(_dependency(reference) for reference in item.references),
         approval=_approval(getattr(declaration, "approval", None)),
         permission=_text(getattr(declaration, "permission", None)),
@@ -210,11 +210,12 @@ def _dependency(reference: ResolvedReference) -> Dependency:
         target_identity=target.identity,
         target_version=target.version,
         target_owner=target.owner,
-        target_kind=_kind(target.declaration),
+        target_kind=definition_kind(target.declaration),
     )
 
 
-def _kind(declaration: type[Declaration]) -> str:
+def definition_kind(declaration: type[Declaration]) -> str:
+    """Classify a declaration for version-explicit snapshot and manifest views."""
     for kind in (Module, ObjectType, Value, Action, Function, Effect):
         if issubclass(declaration, kind):
             return kind.__name__
