@@ -132,6 +132,7 @@ class RequiredApproval:
     self_approval: bool
     intent_fingerprint: str
     callback_key: str
+    permission: str = ""
 
     def document(self) -> dict[str, object]:
         return {
@@ -148,6 +149,7 @@ class RequiredApproval:
             "self_approval": self.self_approval,
             "intent_fingerprint": self.intent_fingerprint,
             "callback_key": self.callback_key,
+            "permission": self.permission,
         }
 
 
@@ -315,6 +317,7 @@ def new_approval(
     self_approval: bool,
     intent_fingerprint: str,
     execution_id: str,
+    permission: str = "",
 ) -> RequiredApproval:
     """Mint one approval identity and the callback key derived from it."""
     approval_id = "AP-" + uuid.uuid4().hex
@@ -328,12 +331,30 @@ def new_approval(
         self_approval,
         intent_fingerprint,
         f"{execution_id}:{approval_id}",
+        permission,
     )
 
 
 def encode_awaiting(execution: AwaitingExecution) -> str:
     """Encode one waiting execution as the canonical ledger payload."""
     return serialize(execution.document())
+
+
+def encode_approval(approval: RequiredApproval) -> str:
+    """Encode one approval requirement beside the decision it authorizes."""
+    return serialize(approval.document())
+
+
+def decode_approval(payload: str) -> RequiredApproval | None:
+    """Decode a pinned approval, returning None when it cannot be trusted."""
+    document = deserialize(payload)
+    if document is None:
+        return None
+    try:
+        decoded = _decode_required_approval(document)
+    except (InvalidAwaitingRecord, KeyError, TypeError, ValueError):
+        return None
+    return decoded
 
 
 def _exact(document: Mapping[str, object], keys: frozenset[str], label: str) -> None:
@@ -437,23 +458,22 @@ def _decode_material_intent(value: object) -> MaterialIntent:
 
 def _decode_required_approval(value: object) -> RequiredApproval:
     document = _as_document(value, "required_approval")
-    _exact(
-        document,
-        frozenset(
-            {
-                "approval_id",
-                "role",
-                "tenant",
-                "scope",
-                "requester",
-                "expires_at",
-                "self_approval",
-                "intent_fingerprint",
-                "callback_key",
-            }
-        ),
-        "required_approval",
+    keys = frozenset(document)
+    required_keys = frozenset(
+        {
+            "approval_id",
+            "role",
+            "tenant",
+            "scope",
+            "requester",
+            "expires_at",
+            "self_approval",
+            "intent_fingerprint",
+            "callback_key",
+        }
     )
+    if keys not in (required_keys, required_keys | {"permission"}):
+        raise InvalidAwaitingRecord("required_approval has unexpected or missing fields.")
     scope = tuple(
         _text(item, "required_approval.scope")
         for item in _sequence(document["scope"], "required_approval.scope")
@@ -471,6 +491,11 @@ def _decode_required_approval(value: object) -> RequiredApproval:
         self_approval,
         _text(document["intent_fingerprint"], "required_approval.intent_fingerprint"),
         _text(document["callback_key"], "required_approval.callback_key"),
+        (
+            _text(document["permission"], "required_approval.permission")
+            if "permission" in document
+            else ""
+        ),
     )
 
 
@@ -537,6 +562,7 @@ def build_awaiting(
     principal: Principal,
     scopes: tuple[str, ...],
     expires_at: str | None,
+    permission: str,
 ) -> AwaitingExecution | None:
     """Freeze a waiting execution when the declaration's predicate fires."""
     evaluation = evaluate_predicate(approval.when, arguments)
@@ -560,6 +586,7 @@ def build_awaiting(
         self_approval=approval.self_approval,
         intent_fingerprint=intent.fingerprint,
         execution_id=execution_id,
+        permission=permission,
     )
     return AwaitingExecution(
         execution_id,
@@ -623,6 +650,8 @@ __all__ = [
     "build_material_intent",
     "decode_awaiting",
     "encode_awaiting",
+    "decode_approval",
+    "encode_approval",
     "evaluate_predicate",
     "new_approval",
 ]
