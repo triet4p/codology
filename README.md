@@ -4,7 +4,7 @@ Codology (Ontology as Code) là framework khai báo thực thể, quan hệ và 
 
 ## Trạng thái
 
-Sprint 4 đã hoàn tất với lát cắt thực thi nguyên tử đồng bộ. [Sprint 5](docs/sprint-plans/sprint-5.md) đang triển khai từng phần: manifest ghim revision, trạng thái chờ ở cửa `invoke`, cửa quyết định duyệt, resume và ghi outbox cùng transaction đã có; giao lại effect vẫn chưa được hỗ trợ. Các phần đã có:
+Sprint 4 đã hoàn tất với lát cắt thực thi nguyên tử đồng bộ. [Sprint 5](docs/sprint-plans/sprint-5.md) đang triển khai từng phần: manifest ghim revision, trạng thái chờ ở cửa `invoke`, cửa quyết định duyệt, resume, ghi outbox cùng transaction và relay local đã có; phần consumer mẫu cuối cùng vẫn đang triển khai. Các phần đã có:
 
 
 - `codology` import được từ môi trường sạch, không cần database, credential hay backend SDK.
@@ -18,6 +18,7 @@ Sprint 4 đã hoàn tất với lát cắt thực thi nguyên tử đồng bộ.
 - `engine.resume()` mở UoW mới, phân giải đúng manifest đã ghim, chạy lại root và child ở revision đó trên dữ liệu hiện tại, kiểm lại quyền requester/approver, scope, hạn/thu hồi và so `material_intent` trước khi commit. Một transaction chứa guarded write, chuyển ledger, outcome của decision và outbox intent; hết hạn, thu hồi hoặc material đổi thì cấp approval/fingerprint mới, còn guard lệch thì `StalePlan` và rollback. `codology.resume_adapter.ResumeSQLiteProvider` là adapter thật cho đường này.
 
 - `codology.outbox` snapshot payload có kiểu của effect đã khai báo, sinh dedup ID ổn định từ `dedupKey` (mặc định gồm execution ID) và ghi intent `PENDING` trong cùng transaction với đơn, ngân sách và ledger; handler chỉ đăng ký intent, không gọi backend hay gửi thông báo.
+- `codology.relay` giao lại outbox đã commit qua relay local at-least-once, dùng dedup ID bền ở bên nhận để ghi một thông báo địa phương; trạng thái effect (`PENDING`/`PENDING_RETRY`/`DELIVERED`/`FAILED`) được đọc qua cửa `effect.read` riêng, execution vẫn `COMMITTED`. `codology.relay_adapter` cung cấp store và receiver SQLite cùng bảng inbox bền cho host; không có broker hay cam kết exactly-once ngoài DB local.
 
 - Ví dụ Procurement/Finance chạy được trên API thật (`examples/procurement_finance/`) cùng kiểm thử tích hợp và kiểm tra typing cho cả đường thành công lẫn lỗi tĩnh.
 - Ví dụ thực thi (`examples/atomic_approval/`) chạy đường consumer `query → row.as_ref() → invoke` nấc 2 trên adapter SQLite thật: commit đơn và giữ ngân sách trong một transaction, replay theo `request_key`, cùng các nhánh read/invoke denial và split binding. Kiểm thử tích hợp đọc lại dữ liệu bằng connection độc lập.
@@ -65,6 +66,8 @@ src/codology/
   decision.py       # Cửa quyết định: authority live, callback key, audit, terminal reject
   resume.py        # Resume: recompute pinned, live checks, guarded finish, reapproval
   outbox.py        # Effect intent: typed snapshot, stable dedup, bound session
+  relay.py         # Relay local: outbox đã commit, at-least-once, trạng thái effect riêng
+  relay_adapter.py # Store/receiver SQLite, inbox bền theo dedup ID
   results.py        # Attempt/execution record, replay có quyền và reconcile
   binding.py        # Deployment binding: capability, write set, enlistment plan
 
@@ -112,6 +115,7 @@ tests/
   resume_support.py  # graph, schema, provider và hook dùng chung cho resume
   test_resume_adapter.py # race, lost ack, commit bị ngắt, pin sai fail closed
   test_outbox.py     # outbox cùng commit, preview/reject không row, dedup, payload fail closed
+  test_relay.py     # relay chỉ đọc committed, retry/permanent/lost ack, dedup receiver
   test_child_action.py # child đã link, ủy quyền, scope, rollback, một transaction
 
 
@@ -389,6 +393,28 @@ enlistments = (
 ```
 
 Adapter SQLite lưu row với `id` ổn định theo execution + effect, `dedup_id` và payload canonical; cùng dedup ID mà payload khác bị từ chối, còn dedup trùng payload thì không tạo row thứ hai. `execution.status` vẫn là `COMMITTED` bất kể trạng thái giao sau này.
+
+
+## Relay local: giao sau commit, trạng thái effect riêng
+
+`deliver_committed(store, receiver)` chỉ đọc các row outbox đã commit (ledger ghi `COMMITTED`) có trạng thái `PENDING` hoặc `PENDING_RETRY`; relay không gọi `invoke`, `resume`, handler hay mở lại transaction nghiệp vụ. Receiver local ghi thông báo và receipt dedup trong **một transaction SQLite**, nên cùng một `dedup_id` chỉ tạo một thông báo dù relay gửi lại sau khi mất ack. Đây là at-least-once có dedup ở phía nhận, không phải cam kết exactly-once cho broker hay hệ thống ngoài.
+
+```python
+from codology import EFFECT_READ_PERMISSION, deliver_committed, read_effect_status
+from codology.relay_adapter import (
+    SQLiteLocalReceiver,
+    SQLiteRelayStore,
+    create_relay_schema,
+)
+
+create_relay_schema("orders.sqlite3")          # bảng thuộc host, tạo một lần
+store = SQLiteRelayStore("orders.sqlite3")
+receiver = SQLiteLocalReceiver("orders.sqlite3")
+deliveries = deliver_committed(store, receiver)
+states = read_effect_status(store, reader, execution_id)  # reader có 'effect.read'
+```
+
+Giao thành công chuyển row sang `DELIVERED`. Lỗi tạm thời chuyển sang `PENDING_RETRY` và được retry cùng dedup ID; lỗi vĩnh viễn chuyển sang `FAILED` và relay không retry nữa. Nếu receiver đã ghi bền rồi mới mất ack, lần retry trả receipt `replayed=True` mà không thêm notification. Trong mọi nhánh, execution vẫn `COMMITTED`: đơn, ngân sách, ledger và outcome resume không đổi. Việc đọc trạng thái effect đi qua cửa riêng `read_effect_status()` với permission `effect.read` và scope tenant; không dùng quyền đọc execution để giao effect và không đọc execution để sửa effect.
 
 
 ## Deployment binding: kiểm tra plan cho `ATOMIC` và outbox
