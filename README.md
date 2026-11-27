@@ -6,6 +6,8 @@ Codology (Ontology as Code) là framework khai báo thực thể, quan hệ và 
 
 Sprint 4 đã hoàn tất với lát cắt thực thi nguyên tử đồng bộ. [Sprint 5](docs/sprint-plans/sprint-5.md) đã phủ manifest ghim revision, trạng thái chờ ở cửa `invoke`, cửa quyết định duyệt, resume, ghi outbox cùng transaction, relay local và consumer mẫu nấc 3 chạy trên SQLite thật. Các phần đã có:
 
+Sprint 6 bàn giao thêm [hướng dẫn author](docs/author-extension-guide.md), một lát cắt đa miền chạy được và CLI consumer thứ hai; hành vi đã kiểm chứng và giới hạn thực tế được tách riêng trong [ma trận bàn giao](#ma-trận-hỗ-trợ-đã-kiểm-chứng).
+
 
 - `codology` import được từ môi trường sạch, không cần database, credential hay backend SDK.
 - `codology.declarations` cung cấp primitive cấu trúc bất biến `Module`, `ObjectType`, `Value`, `Link` và `ObjectRef[T]`: identity/version tường minh, property có kiểu, link có target/cardinality/traversal và `exports` đóng băng.
@@ -23,6 +25,8 @@ Sprint 4 đã hoàn tất với lát cắt thực thi nguyên tử đồng bộ.
 - Ví dụ Procurement/Finance chạy được trên API thật (`examples/procurement_finance/`) cùng kiểm thử tích hợp và kiểm tra typing cho cả đường thành công lẫn lỗi tĩnh.
 - Ví dụ thực thi (`examples/atomic_approval/`) chạy đường consumer `query → row.as_ref() → invoke` nấc 2 trên adapter SQLite thật: commit đơn và giữ ngân sách trong một transaction, replay theo `request_key`, cùng các nhánh read/invoke denial và split binding. Kiểm thử tích hợp đọc lại dữ liệu bằng connection độc lập.
 - Ví dụ thực thi nấc 3 (`examples/conditional_approval/`) chạy đường `query → ref → invoke → approve/reject → resume → relay` trên adapter SQLite thật: ngưỡng chờ, replay ghim revision sau restart, callback bị từ chối/trùng, duyệt lại, tranh ngân sách, mất ack và relay lỗi; đối chiếu order/budget/ledger/outbox bằng connection độc lập.
+- Ví dụ CLI consumer độc lập (`examples/purchase_order_cli/`) gọi cùng `procurement.approve_purchase_order@2.0.0` qua các cổng công khai từ một tiến trình CLI: đọc theo scope, lấy ref từ row, xử lý chờ/deny/commit, approve bằng callback key và fingerprint do engine phát hành, resume, replay/reconcile theo key gốc và relay. Nó không import consumer mẫu và không chứa ngưỡng, bảng role/quyền, SQL hay hàm dựng fingerprint; kiểm thử chạy CLI bằng subprocess và đối chiếu DB bằng connection độc lập.
+- Ví dụ miền cấp quyền hạ tầng giả lập (`examples/break_glass_access/`) khai báo hai module `access_control` và `security_audit` bằng API công khai: object, typed refs, action cha/con, predicate `any_of` theo thời lượng hoặc mức nhạy cảm, role/permission và effect payload có kiểu. Load/Link/Snapshot kiểm cạnh child/effect và export; phần host bind hai phần ghi cùng outbox vào một session SQLite, chạy `query → ref → invoke → approve → resume → relay`, và test đối chiếu business/version/ledger/outbox bằng connection độc lập.
 - `bind_action()` kiểm tra deployment plan cho action `ATOMIC`: capability của provider, write set bắc cầu qua `calls`, một session enlist chung và mapping ủy quyền không rộng hơn contract; không gọi handler và không mở transaction.
 - `codology.adapter` mở đúng một transaction SQLite vật lý cho mọi write đã bind; `commit_guarded_writes()` là biên commit do engine/port sở hữu, rollback sạch trước commit và chỉ coi `rowcount == 1` là thành công. Mỗi unit đóng connection khi transaction kết thúc (sau commit, rollback hoặc `close()`), và `SQLiteProvider` nhận `timeout` giây cho việc acquire lock. Tiền được biểu diễn bằng số nguyên đơn vị nhỏ (`MinorMoney`) với một currency cố định, không FX.
 - Cửa `engine.query` (hàm `query()`) authorize principal/grant trước khi đọc, chỉ nhận predicate có pushdown đã kiểm chứng, áp tenant/scope ở adapter trước phân trang/count và phát hành ref có type/version từ row. `invoke()` chạy một handler đã khai báo sau khi kiểm quyền ghi live, resolve lại ref theo scope hiện tại, cấp `HandlerCtx` hẹp, revalidate rồi commit một transaction duy nhất cùng bản ghi ledger; publish artifact **chưa được triển khai**.
@@ -40,17 +44,32 @@ uv sync
 
 Lệnh trên tạo `.venv`, cài package ở chế độ editable và cài nhóm dependency `dev` (pytest, Pyright, Ruff).
 
+Để tái lập trong môi trường tách biệt mà không thay `.venv` hiện có, đặt `UV_PROJECT_ENVIRONMENT` trước `uv sync` và giữ nó cho mọi `uv run` tiếp theo, ví dụ `UV_PROJECT_ENVIRONMENT=.tmp/verify/venv uv sync`. `.tmp/` đã được git-ignore; đây là cách gói bàn giao được chạy lại độc lập.
+
 ## Chạy kiểm tra
 
 ```bash
 uv run python -c "import codology; print(codology.__version__)"
 uv run python -m examples.procurement_finance
+uv run python -m examples.break_glass_access
+uv run python -m examples.break_glass_access --runtime
 uv run python -m examples.atomic_approval
 uv run python -m examples.conditional_approval
 uv run pytest
 uv run pyright
 uv run ruff check .
 uv run ruff format --check .
+```
+
+`uv run pyright` toàn repo hiện báo **22 lỗi có từ trước** trong `src/codology/` và các test cũ, nên không dùng làm gate cho gói bàn giao; dùng lệnh Pyright giới hạn phía dưới cho ví dụ và test mới. Hai lệnh Ruff ở trên phải exit 0, kể cả với code block Python trong tệp Markdown.
+
+Hồi quy trọng điểm và kiểm phạm vi mới:
+
+```bash
+uv run pytest -q tests/test_atomic_approval_example.py tests/test_conditional_approval_example.py
+uv run pytest -q tests/test_break_glass_access_example.py tests/test_break_glass_access_runtime.py tests/test_purchase_order_cli.py
+uv run pyright examples/break_glass_access examples/purchase_order_cli \
+  tests/test_break_glass_access_example.py tests/test_break_glass_access_runtime.py tests/test_purchase_order_cli.py
 ```
 
 ## Cấu trúc
@@ -93,6 +112,15 @@ examples/procurement_finance/
   scenarios.py       # sáu ca lỗi tĩnh có thể chạy
   __main__.py        # entry point của ví dụ tĩnh
   runtime.py         # contract nấc 2 riêng cho child action, không approval/effect
+examples/break_glass_access/
+  access_control.py  # GrantRequest, effect payload, GrantAccess, AccessControl
+  security_audit.py  # AuditSession, RecordSession, SecurityAudit
+  model.py           # ghép hai module, load/link/snapshot
+  scenarios.py       # lỗi không export và handler probe
+  database.py        # schema SQLite, seed và helper đọc độc lập
+  wiring.py          # deployment một session, adapter, principal, grant, authority
+  consumer.py        # query -> ref -> invoke/approve/resume/relay, không policy hay SQL
+  __main__.py        # entry point tĩnh và chế độ --runtime trên DB thật
 examples/atomic_approval/
   database.py        # schema SQLite và dữ liệu seed hai tenant
   wiring.py          # graph, deployment plan, adapter, principal và read grant
@@ -104,6 +132,10 @@ examples/conditional_approval/
   wiring.py          # deployment, adapter, principal và authority live
   consumer.py        # query/refs/invoke/callback/resume/reconcile/relay, không policy hay SQL
   __main__.py        # entry point chạy mọi kịch bản có assert
+examples/purchase_order_cli/
+  host.py            # host wiring: caller/resource do host cấp, không policy
+  envelopes.py       # ActionResult/DecisionResult/page/relay sang JSON + bước kế tiếp
+  __main__.py        # CLI query/invoke/approve/resume/reconcile/relay
 tests/
   test_annotations.py
   test_behavior.py
@@ -115,8 +147,11 @@ tests/
   test_loading.py
   test_package.py
   test_procurement_finance_integration.py
+  test_break_glass_access_example.py # Load/Link/Snapshot hai module miền giả lập
+  test_break_glass_access_runtime.py # host SQLite, waiting/deny/approve/resume/relay, split binding
   test_atomic_approval_example.py # commit, denial, split binding, rollback, race, replay
   test_conditional_approval_example.py # consumer nấc 3, đối chiếu DB độc lập
+  test_purchase_order_cli.py # CLI consumer thứ hai chạy subprocess, đối chiếu DB độc lập
   test_snapshot.py
   test_manifest.py   # pin/resolve revision chính xác, digest byte đã nạp, fail closed
   test_waiting.py    # Ngưỡng chờ, replay, không lock/write, tenant và KEY_MISUSE
@@ -308,11 +343,9 @@ from codology import (
 )
 
 linked = link(load(*groups))
-manifest = pin_manifest(
-    linked, DefinitionKey("procurement.approve_purchase_order", "2.0.0")
-)
-payload = encode_manifest(manifest)          # JSON canonical, lưu được vào record
-restored = decode_manifest(payload)          # từ chối field lạ, digest sai, kind sai
+manifest = pin_manifest(linked, DefinitionKey("procurement.approve_purchase_order", "2.0.0"))
+payload = encode_manifest(manifest)  # JSON canonical, lưu được vào record
+restored = decode_manifest(payload)  # từ chối field lạ, digest sai, kind sai
 
 # Host có thể giữ nhiều revision set; manifest chọn đúng set đã ghim.
 resolved = resolve_manifest(restored, (linked_new, linked_old))
@@ -391,9 +424,10 @@ Approval hết hạn/bị thu hồi hoặc material đổi thì resume trả `AW
 from codology import OUTBOX_RESOURCE, Capability, Enlistment, Provider
 
 provider = Provider(
-    "orders-db", "sqlite",
+    "orders-db",
+    "sqlite",
     frozenset({Capability.ATOMIC_TRANSACTION, Capability.OUTBOX}),
-    "sqlite:outbox",                       # effect_dedup bền
+    "sqlite:outbox",  # effect_dedup bền
 )
 enlistments = (
     Enlistment("procurement.purchase_order", "orders-db", "sqlite:main"),
@@ -416,7 +450,7 @@ from codology.relay_adapter import (
     create_relay_schema,
 )
 
-create_relay_schema("orders.sqlite3")          # bảng thuộc host, tạo một lần
+create_relay_schema("orders.sqlite3")  # bảng thuộc host, tạo một lần
 store = SQLiteRelayStore("orders.sqlite3")
 receiver = SQLiteLocalReceiver("orders.sqlite3")
 deliveries = deliver_committed(store, receiver)
@@ -458,7 +492,6 @@ deployment = Deployment(
         Enlistment("finance.budget", "orders-db", "sqlite:main"),
         Enlistment(OUTBOX_RESOURCE, "orders-db", "sqlite:main"),
     ),
-
     delegations=(
         DelegationGrant(
             caller="procurement.approve_purchase_order",
@@ -514,8 +547,11 @@ provider = SQLiteProvider(
     (
         ResourceBinding("finance.budget", "1.0.0", "budgets", ("balance",), currency="VND"),
         ResourceBinding(
-            "procurement.purchase_order", "1.0.0", "purchase_orders",
-            ("status", "approved_amount"), currency="VND",
+            "procurement.purchase_order",
+            "1.0.0",
+            "purchase_orders",
+            ("status", "approved_amount"),
+            currency="VND",
         ),
     ),
 )
@@ -524,12 +560,16 @@ results = commit_guarded_writes(
     plan,
     (
         GuardedWrite(
-            "finance.budget", "B-001", 1,
+            "finance.budget",
+            "B-001",
+            1,
             (Assignment("balance", "add", -amount),),
             (Condition("balance", ">=", amount),),
         ),
         GuardedWrite(
-            "procurement.purchase_order", "PO-001", 1,
+            "procurement.purchase_order",
+            "PO-001",
+            1,
             (
                 Assignment("status", "set", "APPROVED"),
                 Assignment("approved_amount", "set", amount),
@@ -567,9 +607,12 @@ provider = SQLiteProvider(
     "sqlite:main",
     (
         ResourceBinding(
-            "procurement.purchase_order", "1.0.0", "purchase_orders",
+            "procurement.purchase_order",
+            "1.0.0",
+            "purchase_orders",
             ("status", "approved_amount"),
-            tenant_column="tenant", scope_column="scope",
+            tenant_column="tenant",
+            scope_column="scope",
         ),
     ),
 )
@@ -603,10 +646,10 @@ from codology.engine import invoke
 definition = DefinitionKey("procurement.purchase_order", "1.0.0")
 ref = page.rows[0].as_ref()  # từ query() đã authorize ở trên
 result = invoke(
-    linked=linked,                 # kết quả link() của cùng graph
+    linked=linked,  # kết quả link() của cùng graph
     action=DefinitionKey("procurement.approve_order", "1.1.0"),
-    bound=bound,                   # bind_action(snapshot(linked), deployment, action)
-    provider=provider,             # adapter vừa fetch/resolve vừa begin(plan)
+    bound=bound,  # bind_action(snapshot(linked), deployment, action)
+    provider=provider,  # adapter vừa fetch/resolve vừa begin(plan)
     principal=principal,
     grants={definition: grant},
     parameters={"order": ref, "reason": "approved after budget check"},
@@ -628,11 +671,11 @@ Lỗi hạ tầng ở cửa giao dịch — provider không mở đúng session 
 
 ```python
 result = invoke(
-    linked=linked,                    # graph nấc 2 của runtime.py
+    linked=linked,  # graph nấc 2 của runtime.py
     action=DefinitionKey("procurement.approve_purchase_order", "1.1.0"),
-    bound=bound,                      # delegation grant REQUESTER + budget.reserve
+    bound=bound,  # delegation grant REQUESTER + budget.reserve
     provider=provider,
-    principal=principal,              # cần purchase_order.approve và budget.reserve
+    principal=principal,  # cần purchase_order.approve và budget.reserve
     grants=grants,
     parameters={
         "order": order_ref,
@@ -690,6 +733,22 @@ Kết quả in ra gồm: dưới ngưỡng commit thẳng, tại ngưỡng chờ
 
 `tests/test_conditional_approval_example.py` chạy chính các hàm consumer này rồi đọc lại bằng connection độc lập cho 13 ca: entry point, commit dưới ngưỡng, chờ không ghi/không giữ lock, restart/pin, deny/duplicate, reject, duyệt lại, tranh chấp, mất ack commit, ba nhánh relay và cửa đọc effect theo quyền/tenant. Hướng dẫn và non-claims nằm ở [`examples/conditional_approval/README.md`](examples/conditional_approval/README.md).
 
+## Ví dụ CLI consumer độc lập
+
+`examples/purchase_order_cli/` là consumer thứ hai của đúng action `procurement.approve_purchase_order@2.0.0`: một tiến trình CLI gọi trực tiếp các cổng công khai, dùng lại host contract của ví dụ conditional-approval nhưng **không import** `examples/conditional_approval/consumer.py`. CLI chỉ chọn caller do host cấp (`requester`, `approver`, `outsider`) và resource mà host đã map; ngưỡng, bảng role/quyền, logic giữ ngân sách, SQL và hàm dựng fingerprint không có trong mã CLI.
+
+```bash
+uv run python -m examples.purchase_order_cli install --db .tmp/purchase-order-cli/orders.sqlite3
+uv run python -m examples.purchase_order_cli query --db .tmp/purchase-order-cli/orders.sqlite3 --status PENDING
+uv run python -m examples.purchase_order_cli invoke --db .tmp/purchase-order-cli/orders.sqlite3 \
+  --order PO-1 --budget B-1 --reason "approved after budget check" \
+  --request-key tenant-a:alice:approve:PO-1:001
+```
+
+`query` chỉ trả `PO-1` dù DB còn `PO-9` tenant khác. `invoke` trả envelope `AWAITING_APPROVAL` với ref lấy từ `row.as_ref()`, callback key/fingerprint do engine cấp và bước kế tiếp `approve`. Replay `invoke` cùng `request_key` **trong lúc execution còn chờ** trả cùng execution với `deduplicated=True` và không ghi thêm. Sau commit, CLI phải dùng `reconcile --request-key` (hoặc `--execution-id`) để lấy lại cùng execution: CLI luôn query lại nên ref mang version mới, intent vì thế khác và `invoke` cùng key trả `DENIED`/`KEY_MISUSE`, không tăng version hay giữ ngân sách thêm. `approve --as approver` dùng đúng giá trị engine cấp rồi `resume` mới commit execution, hai write, ledger và outbox; `approve --as outsider` trả `DENIED` mà execution vẫn chờ. Khi resume mất ack commit (`--simulate-lost-ack`, hook do host cung cấp), envelope `UNKNOWN` chỉ sang `reconcile` bằng id/key gốc thay vì sinh key mới.
+
+Mỗi lệnh in một JSON object; exit 0 cho envelope hợp lệ (`AWAITING_APPROVAL`, `DENIED`, `UNKNOWN`), exit 2 cho lỗi dùng lệnh. `tests/test_purchase_order_cli.py` chạy CLI bằng subprocess trên fixture SQLite thật và đối chiếu order/budget/ledger/outbox/decision/effect bằng connection độc lập. Chi tiết lệnh, envelope và non-claims ở [`examples/purchase_order_cli/README.md`](examples/purchase_order_cli/README.md).
+
 ## Ví dụ Procurement/Finance
 
 `examples/procurement_finance/` là ví dụ chạy được trên chính API công khai ở trên: hai module Procurement và Finance, `ApprovePurchaseOrder` gọi `finance.reserve_budget`, kèm approval và effect metadata. Chạy từ gốc repo:
@@ -701,6 +760,42 @@ uv run python -m examples.procurement_finance
 Ví dụ in đường Load → Link → Snapshot rồi sáu lỗi tĩnh: `DuplicateIdentity` (Load), `NotExported`, `UnresolvedReference`, `ObjectRefMismatch`, `HandlerMismatch` (Link) và `UnsupportedApprovalExpression` (declaration). `tests/test_procurement_finance_integration.py` kiểm tra lại toàn bộ đường đi và output của entry point; `tests/typing/valid_api.py` ghim kiểu công khai, còn `tests/typing/invalid_api.py` đảm bảo Pyright vẫn bắt các lỗi kiểu có chủ đích.
 
 Không cần backend: handler chỉ là metadata và không được gọi. Declaration nấc 2 trong `runtime.py` không thuộc đường tĩnh này; nó được dùng bởi ví dụ thực thi `examples/atomic_approval/` và các test invoke/child. Hướng dẫn chạy, lỗi và non-claims chi tiết nằm ở [`examples/procurement_finance/README.md`](examples/procurement_finance/README.md).
+
+## Ví dụ miền cấp quyền hạ tầng
+
+`examples/break_glass_access/` là lát cắt đa miền: hai module sở hữu hai phần ghi (`access_control`, `security_audit`), một action cha gọi action con đã export, approval `any_of` theo `duration_minutes >= 60` hoặc `sensitivity == "CRITICAL"`, role `security_officer`, và effect payload có kiểu. Thời lượng là `int` phút ở runtime; effect chỉ ghi một thông báo local, không cấp quyền hay phát hành chứng chỉ thật.
+
+Đường tĩnh dựng Load → Link → Snapshot:
+
+```bash
+uv run python -m examples.break_glass_access
+```
+
+Ví dụ in Load → Link → Snapshot, cạnh `params`/`reads`/`writes`/`calls`/`effects` của hai action, rồi lỗi `NotExported` khi `AuditSession` bị bỏ khỏi export. `tests/test_break_glass_access_example.py` kiểm tra identity/version, edge child/effect, ownership/export, predicate và một handler probe chứng minh Load/Link/Snapshot không chạy handler.
+
+Phần host bind `GrantAccess` (`ATOMIC`) cùng action con, hai phần ghi và `OUTBOX_RESOURCE` vào một session SQLite duy nhất, cấp `Principal`/`ReadGrant`/`LiveAuthority` riêng cho requester và security officer, và chạy trên DB file-backed:
+
+```bash
+uv run python -m examples.break_glass_access --runtime
+```
+
+Chế độ `--runtime` mở DB riêng cho từng ca và assert: request 30 phút không nhạy cảm đi thẳng (hai write, ledger và outbox commit cùng nhau); đúng ngưỡng 60 phút và ca `CRITICAL` 15 phút đều `AWAITING_APPROVAL` mà không ghi business/outbox; callback sai authority `DENIED` không kết thúc execution đang chờ; approve hợp lệ chưa commit cho tới `resume`, replay cùng key/ref không ghi lại; relay chỉ giao sau commit và không chạy lại handler. `tests/test_break_glass_access_runtime.py` đối chiếu từng kết quả API bằng connection SQLite độc lập và kiểm `bind_action()` từ chối deployment tách session.
+
+
+## Ma trận hỗ trợ (đã kiểm chứng)
+
+Bảng chỉ ghi hành vi có bằng chứng chạy lại; cột cuối là non-claim, không phải tính năng được hứa. Lệnh và kết quả thực tế nằm ở [bằng chứng bàn giao](artifacts/sprint-6/tasks/S6-T5-A1.md).
+
+| Năng lực | Trạng thái | Bằng chứng | Non-claims / giới hạn |
+| --- | --- | --- | --- |
+| Author thêm nghiệp vụ ngoài duyệt đơn từ tài liệu | Đã kiểm chứng | [Hướng dẫn author](docs/author-extension-guide.md), [dấu vết author](artifacts/sprint-6/tasks/S6-T2-A1.md), `tests/test_break_glass_access_example.py` | Không sửa `src/codology/`, không xin API lõi mới; handler không được gọi lúc Load/Link |
+| Hai phần ghi và outbox trong một session SQLite | Đã kiểm chứng | [Review T3 PASS](artifacts/sprint-6/reviews/S6-T3-C1.md), `uv run python -m examples.break_glass_access --runtime`, `tests/test_break_glass_access_runtime.py` | Chỉ SQLite file-backed một session; cấu hình tách session bị `NoSharedTransaction`, không có saga |
+| Consumer thứ hai dùng lại hợp đồng duyệt đơn | Đã kiểm chứng | [Review T4 PASS](artifacts/sprint-6/reviews/S6-T4-C1.md), `tests/test_purchase_order_cli.py`, [CLI README](examples/purchase_order_cli/README.md) | Không HTTP/service/SDK/MCP; CLI không policy, SQL, role table hay fingerprint tự dựng |
+| Hồi quy hai đường duyệt đơn | Đã kiểm chứng | `uv run pytest -q tests/test_atomic_approval_example.py tests/test_conditional_approval_example.py` → 24 passed | Không thay thế kiểm thử unit/lõi; không gate coverage hay hiệu năng |
+| Cài đặt từ môi trường sạch | Đã kiểm chứng | `uv sync` vào venv riêng qua `UV_PROJECT_ENVIRONMENT`, `codology 0.1.0` | Không hỗ trợ Python < 3.13; không cam kết dependency ngoài `uv.lock` |
+| Kiểm tĩnh cho sản phẩm bàn giao | Đã kiểm chứng có phạm vi | Pyright giới hạn ví dụ/test mới → 0 errors; `ruff check .` và `ruff format --check .` → sạch | `uv run pyright` toàn repo còn 22 lỗi cũ ngoài phạm vi bàn giao |
+
+Replay chỉ idempotent khi cùng `request_key` **và cùng intent**. Sau commit, ref do CLI query lại có version mới nên `invoke` cùng key bị từ chối; dùng `reconcile` với key/id gốc. Đây là giới hạn đã kiểm chứng, không phải cam kết replay vô điều kiện.
 
 ## Quyết định đã chốt
 
@@ -715,16 +810,20 @@ Không cần backend: handler chỉ là metadata và không được gọi. Decl
 - **Tách authority của callback:** requester và approver là hai vai; host cung cấp role/permission/scope/revocation live, engine kiểm khóa, fingerprint, hạn và `self_approval` từ khai báo. Attempt bị từ chối chỉ vào audit, không chiếm khóa và không kết thúc execution; `reject` hợp lệ là terminal duy nhất không ghi nghiệp vụ, còn `approve` chỉ là decision chờ resume.
 - **Consumer mẫu trên adapter thật:** `examples/atomic_approval/` giữ phần caller chỉ ở `query`, `row.as_ref()` và `invoke`; quyền, ngân sách và write nằm trong declaration/handler và engine. Split binding nấc 2 (hai file cùng SQLite) vẫn bị từ chối trước runtime, không hạ xuống saga.
 - **Consumer nấc 3 trên adapter thật:** `examples/conditional_approval/` giữ caller ở các cửa công khai (`query`, `invoke`, `approve`/`reject`, `resume`, `reconcile`, `deliver_committed`, `read_effect_status`); fingerprint lấy từ execution record, không tự dựng policy hay SQL. Ví dụ nấc 2 `examples/atomic_approval/` vẫn chỉ phủ đường đồng bộ và không được đọc như consumer nấc 3.
+- **Consumer thứ hai dùng lại hợp đồng:** `examples/purchase_order_cli/` gọi đúng `procurement.approve_purchase_order@2.0.0` qua các cổng công khai và tự diễn giải envelope; `callback_key`/`intent_fingerprint` chỉ được chuyển tiếp từ engine, không import consumer mẫu, không chứa policy, SQL hay fingerprint tự dựng. Host vẫn giữ bind, principal và grant.
 - Chi tiết và hệ quả cho các task sau: [`docs/official/design/implementation-baseline.md`](docs/official/design/implementation-baseline.md).
 
 ## Giới hạn
 
-- Đây vẫn là lớp mô hình tĩnh, manifest pin local trên graph đã link, deployment binding plan-check, adapter transaction có guarded write, cửa đọc có policy, cửa ghi `invoke()` với child đã link, sổ yêu cầu/kết quả bền vững, trạng thái chờ, cửa quyết định, resume, outbox intent cùng commit, relay local và consumer mẫu nấc 3. `examples/atomic_approval/` giữ consumer nấc 2; `examples/conditional_approval/` là consumer nấc 3 trên SQLite một file. Chưa có publish artifact/registry.
+- Đây vẫn là lớp mô hình tĩnh, manifest pin local trên graph đã link, deployment binding plan-check, adapter transaction có guarded write, cửa đọc có policy, cửa ghi `invoke()` với child đã link, sổ yêu cầu/kết quả bền vững, trạng thái chờ, cửa quyết định, resume, outbox intent cùng commit, relay local và consumer mẫu nấc 3. `examples/atomic_approval/` giữ consumer nấc 2; `examples/conditional_approval/` là consumer nấc 3 trên SQLite một file; `examples/purchase_order_cli/` là CLI consumer độc lập dùng chung host contract đó. Chưa có publish artifact/registry.
 
 - Load đã thu thập definition và kiểm tra identity/field; Link đã resolve reference, kiểm tra export/kind và chữ ký handler; snapshot đã công bố graph bất biến với lookup tường minh; `pin_manifest()`/`resolve_manifest()` đã pin và phân giải đúng revision kèm digest artifact; `bind_action()` đã kiểm tra capability, write set và enlistment plan trên snapshot; `waiting` lưu canonical input, material intent và approval dưới key duy nhất, `decision` giữ callback key, authority live và audit attempt, `gate_support` giữ kiểm tra thuần dùng chung, còn `results` tách representation và replay của execution. Adapter transaction thật đã có; chưa có registry bền vững hay publish artifact.
 - Predicate approval được đánh giá có cấu trúc tại cửa `invoke` cho nhánh chờ, kèm fingerprint của material intent; callback, resume, outbox và relay/giao effect đã có bằng chứng chạy được qua consumer mẫu. `Function` dùng cùng quy ước `handler(self, ctx, ...)` với `Action` theo implementation baseline.
 
 - Bằng chứng invoke và callback chỉ phủ handler đơn, một child đã link và sổ yêu cầu/kết quả trên adapter SQLite đã bind: từ chối quyền/scope/type/ref cũ, `REJECTED`, guard stale, ghi ngoài declaration, child sai revision/quyền/scope, key trùng intent khác, race cùng key và hai đơn tranh một budget, split binding và replay sau mất phản hồi; phần chờ kiểm ngưỡng dưới/tại/trên, precondition rớt, replay sau mở lại engine và đổi revision mặc định, connection khác ghi được lúc chờ, không có write đơn/ngân sách/outbox và phân quyền tenant/đọc; phần quyết định kiểm outsider, sai tenant/scope/key/fingerprint, mất role/quyền, tự duyệt theo declaration, hết hạn/thu hồi/thay approval, replay có kiểm quyền, `KEY_MISUSE` và reject terminal một lần không ghi nghiệp vụ; phần outbox đối soát row bền bằng connection độc lập trên cả hai nhánh commit, không có row lúc chờ/từ chối/rollback/replay, dedup ổn định và payload/declaration sai bị chặn. Phần relay kiểm committed-only, transient retry, permanent fail và lost ack với đúng một thông báo địa phương; consumer nấc 3 đối chiếu order/budget/ledger/outbox bằng connection độc lập. Không có tuyên bố về publish artifact, PostgreSQL/ERP, mọi lịch trình interleaving, crash/power-loss, exactly-once ngoài DB local hay sandbox handler trong-process.
+
+- `uv run pyright` toàn repo chưa sạch: 22 lỗi có từ trước nằm ở `src/codology/engine.py`, `money.py`, `outbox.py`, `uow.py` và `tests/resume_support.py`, `tests/test_outbox.py`. Gói bàn giao dùng lệnh Pyright giới hạn ở mục "Chạy kiểm tra" (0 errors); không sửa lõi để che lỗi cũ.
+- CLI query lại ref khi chạy `invoke`, nên sau commit cùng `request_key` mà intent đổi (version mới) trả `DENIED`/`KEY_MISUSE`; `reconcile --request-key` hoặc `--execution-id` mới là đường tra cứu sau commit. Xem chi tiết ở mục CLI và [ma trận bàn giao](#ma-trận-hỗ-trợ-đã-kiểm-chứng).
 
 - Static validation không phát hiện truy cập ẩn trong thân handler (import lén, `getattr` động, đọc file/socket). Binding chỉ kiểm tra mapping khai báo; nó không phát hiện host code tự mở connection hoặc dùng credential ambient ngoài plan và không sandbox handler. Đó là rủi ro đã ghi nhận, xử lý bằng review và test.
 
@@ -736,3 +835,6 @@ Không cần backend: handler chỉ là metadata và không được gọi. Decl
 - [Implementation baseline](docs/official/design/implementation-baseline.md)
 - [Developer Contract](docs/official/design/developer-contract.md)
 - [Framework Design v0.1](docs/official/design/framework-design-v0.1.md)
+- [Hướng dẫn author mở rộng](docs/author-extension-guide.md) — điểm vào cho developer không viết lõi, có CLI link ở §7.
+- [CLI consumer độc lập](examples/purchase_order_cli/README.md) — lệnh, envelope và non-claims.
+- [Bằng chứng bàn giao S6-T5](artifacts/sprint-6/tasks/S6-T5-A1.md) — lệnh, kết quả và môi trường tái lập.
